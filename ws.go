@@ -283,10 +283,10 @@ func releaseWSBuf(buf *bytes.Buffer) {
 	}
 }
 
-// readMessage reads one websocket message into a pooled buffer. The caller
-// must releaseWSBuf it after the message has been fully processed (dispatch
-// is synchronous; sonic's stdlib-compatible config copies decoded strings,
-// so nothing references the buffer afterwards).
+// readMessage reads one websocket message into a pooled buffer. handleMessage
+// releases it once the message has been fully processed (dispatch is
+// synchronous; sonic's stdlib-compatible config copies decoded strings, so
+// nothing references the buffer afterwards).
 func (w *WebsocketClient) readMessage() (*bytes.Buffer, error) {
 	_, r, err := w.conn.NextReader()
 	if err != nil {
@@ -346,18 +346,26 @@ func (w *WebsocketClient) readPump(ctx context.Context) {
 				w.logDebugf("[<] %s", buf.String())
 			}
 
-			wsMsg, err := decodeWsEnvelope(buf.Bytes())
-			if err != nil {
-				w.logErrf("websocket message parse error: %v", err)
-				releaseWSBuf(buf)
-				continue
-			}
-
-			if err := w.dispatch(wsMsg); err != nil {
-				w.logErrf("failed to dispatch websocket message: %v", err)
-			}
-			releaseWSBuf(buf)
+			w.handleMessage(buf)
 		}
+	}
+}
+
+// handleMessage decodes and dispatches one raw websocket message. The pooled
+// buffer is released via defer — exactly once on every exit path (decode
+// error, dispatch error, success), and still released if a subscriber
+// callback panics, so adding a recover later cannot leak it.
+func (w *WebsocketClient) handleMessage(buf *bytes.Buffer) {
+	defer releaseWSBuf(buf)
+
+	wsMsg, err := decodeWsEnvelope(buf.Bytes())
+	if err != nil {
+		w.logErrf("websocket message parse error: %v", err)
+		return
+	}
+
+	if err := w.dispatch(wsMsg); err != nil {
+		w.logErrf("failed to dispatch websocket message: %v", err)
 	}
 }
 
@@ -402,7 +410,21 @@ func decodeWsEnvelope(msg []byte) (wsMessage, error) {
 		if err != nil {
 			return wsMessage{}, fmt.Errorf("failed to parse websocket message: %w", err)
 		}
-		channel, _ := node.Get("channel").String()
+		// ValidateJSON=false also relaxes type checking: a missing channel
+		// yields a nil node and a numeric/null channel casts to text without
+		// error, so the type must be pinned explicitly — otherwise malformed
+		// frames sail through with an empty/garbage channel instead of a parse
+		// error like the small-message struct path produces.
+		channelNode := node.Get("channel")
+		if channelNode == nil || channelNode.TypeSafe() != ast.V_STRING {
+			return wsMessage{}, fmt.Errorf(
+				"failed to parse websocket message: \"channel\" is missing or not a string",
+			)
+		}
+		channel, err := channelNode.String()
+		if err != nil {
+			return wsMessage{}, fmt.Errorf("failed to parse websocket message: %w", err)
+		}
 		wsMsg := wsMessage{Channel: channel}
 		if data := node.Get("data"); data.Valid() {
 			raw, err := data.Raw()

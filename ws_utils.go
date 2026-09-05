@@ -106,6 +106,26 @@ func keyBbo(coin string) string {
 	return bboKeyCache.get(coin, func() string { return key(ChannelBbo, coin) })
 }
 
+// dexOption lifts a message payload's dex field into an Option so that
+// message-side keys go through the same builders as subscription keys: an
+// empty dex is the no-dex case, matching a subscription made without one.
+func dexOption(dex string) fp.Option[string] {
+	if dex == "" {
+		return fp.None[string]()
+	}
+	return fp.Some(dex)
+}
+
+// dexOptionFromPtr is dexOption for the optional dex on subscription
+// payloads: both a nil pointer and a pointer to "" mean "no dex", so a
+// subscription written either way keys the same as the messages it receives.
+func dexOptionFromPtr(dex *string) fp.Option[string] {
+	if dex == nil {
+		return fp.None[string]()
+	}
+	return dexOption(*dex)
+}
+
 func keyClearinghouseState(user string, dex fp.Option[string]) string {
 	if dex.IsNone() {
 		return key(ChannelClearinghouseState, user)
@@ -127,9 +147,11 @@ func keyTwapStates(user string, dex fp.Option[string]) string {
 	return key(ChannelTwapStates, user, dex.UnwrapUnsafe())
 }
 
-func keyWebData3(user string, dex fp.Option[string]) string {
-	if dex.IsNone() {
-		return key(ChannelWebData3, user)
-	}
-	return key(ChannelWebData3, user, dex.UnwrapUnsafe())
+func keyWebData3(user string, _ fp.Option[string]) string {
+	// Unfortunately, webData3 messages carry no dex field (only
+	// userState.user), so we are rendered unable to distinguish between
+	// DEXes from the subscriber's standpoint — same limitation as keyAllMids.
+	// Both sides therefore key on the user alone: two webData3 subscriptions
+	// for the same user on different dexes share one subscriber.
+	return key(ChannelWebData3, user)
 }

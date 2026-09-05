@@ -75,26 +75,17 @@ func (c ClearinghouseState) Key() string {
 }
 
 func (c ClearinghouseStateMessage) Key() string {
-	if c.Dex == "" {
-		return key(ChannelClearinghouseState, c.User)
-	}
-	return key(ChannelClearinghouseState, c.User, c.Dex)
+	return keyClearinghouseState(c.User, dexOption(c.Dex))
 }
 
 func (o OpenOrders) Key() string {
-	// OpenOrders messages contain user and dex info, but we use the subscription key for dispatching
-	// The subscription key already includes dex, so we just return a generic key
-	return ChannelOpenOrders
+	return keyOpenOrders(o.User, dexOption(o.Dex))
 }
 
 func (t TwapStates) Key() string {
-	// TwapStates messages contain user and dex info, but we use the subscription key for dispatching
-	// The subscription key already includes dex, so we just return a generic key
-	return ChannelTwapStates
+	return keyTwapStates(t.User, dexOption(t.Dex))
 }
 
 func (w WebData3) Key() string {
-	// WebData3 messages are user-specific but don't contain user/dex info in the message itself.
-	// The dispatching is handled by the subscription system based on the subscription key.
-	return ChannelWebData3
+	return keyWebData3(w.UserState.User, fp.None[string]())
 }

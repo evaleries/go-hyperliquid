@@ -173,7 +173,7 @@ func (p remoteClearinghouseStateSubscriptionPayload) Channel() string {
 }
 
 func (p remoteClearinghouseStateSubscriptionPayload) Key() string {
-	return keyClearinghouseState(p.User, fp.OptionFromPtr(p.Dex))
+	return keyClearinghouseState(p.User, dexOptionFromPtr(p.Dex))
 }
 
 type remoteOpenOrdersSubscriptionPayload struct {
@@ -187,7 +187,7 @@ func (p remoteOpenOrdersSubscriptionPayload) Channel() string {
 }
 
 func (p remoteOpenOrdersSubscriptionPayload) Key() string {
-	return keyOpenOrders(p.User, fp.OptionFromPtr(p.Dex))
+	return keyOpenOrders(p.User, dexOptionFromPtr(p.Dex))
 }
 
 type remoteTwapStatesSubscriptionPayload struct {
@@ -201,7 +201,7 @@ func (p remoteTwapStatesSubscriptionPayload) Channel() string {
 }
 
 func (p remoteTwapStatesSubscriptionPayload) Key() string {
-	return keyTwapStates(p.User, fp.OptionFromPtr(p.Dex))
+	return keyTwapStates(p.User, dexOptionFromPtr(p.Dex))
 }
 
 type remoteWebData3SubscriptionPayload struct {
@@ -215,5 +215,5 @@ func (p remoteWebData3SubscriptionPayload) Channel() string {
 }
 
 func (p remoteWebData3SubscriptionPayload) Key() string {
-	return keyWebData3(p.User, fp.OptionFromPtr(p.Dex))
+	return keyWebData3(p.User, dexOptionFromPtr(p.Dex))
 }
