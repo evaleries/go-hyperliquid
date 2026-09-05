@@ -11,27 +11,34 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/common/math"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-func addressToBytes(address string) []byte {
-	address = strings.TrimPrefix(address, "0x")
-	bytes, _ := hex.DecodeString(address)
-	return bytes
-}
-
 // convertStr16ToStr8 converts msgpack str16 (0xda + 2 byte length) to str8 (0xd9 + 1 byte length)
 // for strings <256 bytes to match Python msgpack behavior.
 // Uses a structure-aware msgpack walker to avoid corrupting non-string data
 // that happens to contain 0xda as a data byte (e.g. inside uint64 values).
 func convertStr16ToStr8(data []byte) []byte {
-	result := make([]byte, 0, len(data))
+	return convertStr16ToStr8Extra(data, 0)
+}
+
+// convertStr16ToStr8Extra is convertStr16ToStr8 with extra reserved capacity,
+// so callers that append a trailer to the result avoid a reallocation.
+//
+// When the payload contains no convertible str16 header (the common case),
+// the input is returned as-is: no copy, no allocation. Callers must not rely
+// on receiving an independent copy.
+func convertStr16ToStr8Extra(data []byte, extraCap int) []byte {
+	if !msgpackNeedsStr16Conversion(data) {
+		return data
+	}
+	result := make([]byte, 0, len(data)+extraCap)
 	pos := 0
 	for pos < len(data) {
 		consumed := walkMsgpackValue(data, pos, &result)
@@ -43,6 +50,225 @@ func convertStr16ToStr8(data []byte) []byte {
 		pos += consumed
 	}
 	return result
+}
+
+// msgpackNeedsStr16Conversion reports whether data contains a str16 header
+// for a string shorter than 256 bytes (the only case convertStr16ToStr8
+// rewrites). It mirrors walkMsgpackValue structurally but writes nothing.
+// Malformed data returns true so callers take the copying fail-safe path.
+func msgpackNeedsStr16Conversion(data []byte) bool {
+	pos := 0
+	for pos < len(data) {
+		convertible, consumed := scanMsgpackValue(data, pos)
+		if convertible {
+			return true
+		}
+		if consumed <= 0 {
+			return true // malformed: let the copying path handle it
+		}
+		pos += consumed
+	}
+	return false
+}
+
+// scanMsgpackValue is the write-free twin of walkMsgpackValue: it parses one
+// msgpack value at data[pos] and returns (true, n) when the value itself is a
+// convertible str16 consuming n bytes, or (false, n) otherwise. A (false, 0)
+// result marks truncated/malformed data. For container values the walk
+// short-circuits on the first convertible child (consumed is then invalid,
+// but callers only use it when the result is false).
+func scanMsgpackValue(data []byte, pos int) (bool, int) {
+	if pos >= len(data) {
+		return false, 0
+	}
+	b := data[pos]
+	remaining := len(data) - pos
+
+	// --- Fixed-length single-byte types ---
+	if b <= 0x7f || b >= 0xe0 || (b >= 0xc0 && b <= 0xc3) {
+		return false, 1
+	}
+
+	// scanChildren walks count nested values starting after a headerSize-byte
+	// container header, short-circuiting on the first convertible child.
+	scanChildren := func(headerSize, count int) (bool, int) {
+		if remaining < headerSize {
+			return false, 0
+		}
+		consumed := headerSize
+		for i := 0; i < count; i++ {
+			conv, c := scanMsgpackValue(data, pos+consumed)
+			if conv {
+				return true, 0
+			}
+			if c <= 0 {
+				return false, 0
+			}
+			consumed += c
+		}
+		return false, consumed
+	}
+
+	// --- fixstr (0xa0-0xbf) ---
+	if b >= 0xa0 && b <= 0xbf {
+		n := int(b & 0x1f)
+		if remaining < 1+n {
+			return false, 0
+		}
+		return false, 1 + n
+	}
+
+	// --- fixmap (0x80-0x8f) ---
+	if b >= 0x80 && b <= 0x8f {
+		return scanChildren(1, int(b&0x0f)*2)
+	}
+
+	// --- fixarray (0x90-0x9f) ---
+	if b >= 0x90 && b <= 0x9f {
+		return scanChildren(1, int(b&0x0f))
+	}
+
+	switch b {
+	case 0xca: // float32: 1+4
+		return false, scanFixed(data, pos, 5)
+	case 0xcb: // float64: 1+8
+		return false, scanFixed(data, pos, 9)
+
+	// --- unsigned integers ---
+	case 0xcc:
+		return false, scanFixed(data, pos, 2)
+	case 0xcd:
+		return false, scanFixed(data, pos, 3)
+	case 0xce:
+		return false, scanFixed(data, pos, 5)
+	case 0xcf:
+		return false, scanFixed(data, pos, 9)
+
+	// --- signed integers ---
+	case 0xd0:
+		return false, scanFixed(data, pos, 2)
+	case 0xd1:
+		return false, scanFixed(data, pos, 3)
+	case 0xd2:
+		return false, scanFixed(data, pos, 5)
+	case 0xd3:
+		return false, scanFixed(data, pos, 9)
+
+	// --- fixext 1/2/4/8/16 ---
+	case 0xd4:
+		return false, scanFixed(data, pos, 3)
+	case 0xd5:
+		return false, scanFixed(data, pos, 4)
+	case 0xd6:
+		return false, scanFixed(data, pos, 6)
+	case 0xd7:
+		return false, scanFixed(data, pos, 10)
+	case 0xd8:
+		return false, scanFixed(data, pos, 18)
+
+	// --- bin 8/16/32 ---
+	case 0xc4:
+		return false, scanVarLen(data, pos, 1)
+	case 0xc5:
+		return false, scanVarLen(data, pos, 2)
+	case 0xc6:
+		return false, scanVarLen(data, pos, 4)
+
+	// --- ext 8/16/32 ---
+	case 0xc7:
+		return false, scanExtVarLen(data, pos, 1)
+	case 0xc8:
+		return false, scanExtVarLen(data, pos, 2)
+	case 0xc9:
+		return false, scanExtVarLen(data, pos, 4)
+
+	// --- str8: already compact ---
+	case 0xd9:
+		return false, scanVarLen(data, pos, 1)
+
+	// --- str16 (0xda): THE conversion target ---
+	case 0xda:
+		if remaining < 3 {
+			return false, 0
+		}
+		length := (int(data[pos+1]) << 8) | int(data[pos+2])
+		total := 3 + length
+		if remaining < total {
+			return false, 0
+		}
+		return length < 256, total
+
+	// --- str32 ---
+	case 0xdb:
+		return false, scanVarLen(data, pos, 4)
+
+	// --- array16/32 ---
+	case 0xdc:
+		if remaining < 3 {
+			return false, 0
+		}
+		count := (int(data[pos+1]) << 8) | int(data[pos+2])
+		return scanChildren(3, count)
+	case 0xdd:
+		if remaining < 5 {
+			return false, 0
+		}
+		count := (int(data[pos+1]) << 24) | (int(data[pos+2]) << 16) | (int(data[pos+3]) << 8) | int(data[pos+4])
+		return scanChildren(5, count)
+
+	// --- map16/32 ---
+	case 0xde:
+		if remaining < 3 {
+			return false, 0
+		}
+		count := (int(data[pos+1]) << 8) | int(data[pos+2])
+		return scanChildren(3, count*2)
+	case 0xdf:
+		if remaining < 5 {
+			return false, 0
+		}
+		count := (int(data[pos+1]) << 24) | (int(data[pos+2]) << 16) | (int(data[pos+3]) << 8) | int(data[pos+4])
+		return scanChildren(5, count*2)
+
+	default:
+		return false, 1
+	}
+}
+
+// scanFixed mirrors copyFixed without writing.
+func scanFixed(data []byte, pos, size int) int {
+	if len(data)-pos < size {
+		return 0
+	}
+	return size
+}
+
+// scanVarLen mirrors copyVarLen without writing.
+func scanVarLen(data []byte, pos, lenBytes int) int {
+	headerSize := 1 + lenBytes
+	if len(data)-pos < headerSize {
+		return 0
+	}
+	length := readLen(data, pos+1, lenBytes)
+	total := headerSize + length
+	if len(data)-pos < total {
+		return 0
+	}
+	return total
+}
+
+// scanExtVarLen mirrors copyExtVarLen without writing.
+func scanExtVarLen(data []byte, pos, lenBytes int) int {
+	headerSize := 1 + lenBytes + 1 // format + len + type byte
+	if len(data)-pos < headerSize {
+		return 0
+	}
+	length := readLen(data, pos+1, lenBytes)
+	total := headerSize + length
+	if len(data)-pos < total {
+		return 0
+	}
+	return total
 }
 
 // walkMsgpackValue parses one msgpack value at data[pos], appends the
@@ -311,38 +537,55 @@ func readLen(data []byte, pos, size int) int {
 	}
 }
 
-func actionHash(action any, vaultAddress string, nonce int64, expiresAfter *int64) []byte {
-	var buf bytes.Buffer
-	enc := msgpack.NewEncoder(&buf)
+// actionBufPool recycles the msgpack encode buffers used by actionHash;
+// 256 bytes covers typical action payloads without regrowth.
+var actionBufPool = sync.Pool{New: func() any {
+	return bytes.NewBuffer(make([]byte, 0, 256))
+}}
+
+// actionEncPool recycles msgpack encoders. UseCompactInts is set once at
+// creation and persists across Reset.
+var actionEncPool = sync.Pool{New: func() any {
+	enc := msgpack.NewEncoder(nil)
+	enc.UseCompactInts(true)
+	return enc
+}}
+
+func actionHash(action any, vaultAddress string, nonce int64, expiresAfter *int64) [32]byte {
+	buf := actionBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer actionBufPool.Put(buf)
+
+	enc := actionEncPool.Get().(*msgpack.Encoder)
+	enc.Reset(buf)
+	defer actionEncPool.Put(enc)
 	// CRITICAL: Do NOT use SetSortMapKeys(true) - Python preserves insertion order
 	// Structs in Go will serialize fields in the order they are defined
-	enc.UseCompactInts(true)
 
 	err := enc.Encode(action)
 	if err != nil {
 		panic(fmt.Sprintf("failed to marshal action: %v", err))
 	}
-	data := buf.Bytes()
 
-	// Convert fixstr to str8 for Python compatibility
-	data = convertStr16ToStr8(data)
-
-	// fmt.Printf("🔍 DEBUG actionHash msgpack: %s\n", hex.EncodeToString(data))
+	// Convert fixstr to str8 for Python compatibility. Reserve extra capacity
+	// for the trailer (8-byte nonce + up to 1+20 vault + 1+8 expires) so the
+	// appends below don't reallocate.
+	data := convertStr16ToStr8Extra(buf.Bytes(), 38)
 
 	// Add nonce as 8 bytes big endian
 	if nonce < 0 {
 		panic(fmt.Sprintf("nonce cannot be negative: %d", nonce))
 	}
-	nonceBytes := make([]byte, 8)
-	binary.BigEndian.PutUint64(nonceBytes, uint64(nonce))
-	data = append(data, nonceBytes...)
+	data = binary.BigEndian.AppendUint64(data, uint64(nonce))
 
 	// Add vault address
 	if vaultAddress == "" {
 		data = append(data, 0x00)
 	} else {
+		var addr [20]byte
+		_, _ = hex.Decode(addr[:], []byte(strings.TrimPrefix(vaultAddress, "0x")))
 		data = append(data, 0x01)
-		data = append(data, addressToBytes(vaultAddress)...)
+		data = append(data, addr[:]...)
 	}
 
 	// Add expires_after if provided
@@ -351,55 +594,11 @@ func actionHash(action any, vaultAddress string, nonce int64, expiresAfter *int6
 			panic(fmt.Sprintf("expiresAfter cannot be negative: %d", *expiresAfter))
 		}
 		data = append(data, 0x00)
-		expiresAfterBytes := make([]byte, 8)
-		binary.BigEndian.PutUint64(expiresAfterBytes, uint64(*expiresAfter))
-		data = append(data, expiresAfterBytes...)
+		data = binary.BigEndian.AppendUint64(data, uint64(*expiresAfter))
 	}
 
-	// Return keccak256 hash
-	hash := crypto.Keccak256(data)
-	// fmt.Printf("   Msgpack data: %s\n", hex.EncodeToString(data))
-	// fmt.Printf("   Action hash: %s\n", hex.EncodeToString(hash))
-	return hash
-}
-
-func constructPhantomAgent(hash []byte, isMainnet bool) map[string]any {
-	source := "b" // testnet
-	if isMainnet {
-		source = "a" // mainnet
-	}
-	return map[string]any{
-		"source":       source,
-		"connectionId": hash,
-	}
-}
-
-func l1Payload(phantomAgent map[string]any, isMainnet bool) apitypes.TypedData {
-	// Note: chainId is 1337 for both mainnet and testnet - it's just a signing domain identifier
-	chainId := math.HexOrDecimal256(*big.NewInt(1337))
-
-	return apitypes.TypedData{
-		Domain: apitypes.TypedDataDomain{
-			ChainId:           &chainId,
-			Name:              "Exchange",
-			Version:           "1",
-			VerifyingContract: "0x0000000000000000000000000000000000000000",
-		},
-		Types: apitypes.Types{
-			"Agent": []apitypes.Type{
-				{Name: "source", Type: "string"},
-				{Name: "connectionId", Type: "bytes32"},
-			},
-			"EIP712Domain": []apitypes.Type{
-				{Name: "name", Type: "string"},
-				{Name: "version", Type: "string"},
-				{Name: "chainId", Type: "uint256"},
-				{Name: "verifyingContract", Type: "address"},
-			},
-		},
-		PrimaryType: "Agent",
-		Message:     phantomAgent,
-	}
+	// Return keccak256 hash (value return: no []byte heap allocation)
+	return crypto.Keccak256Hash(data)
 }
 
 // SignatureResult represents the structured signature result
@@ -507,7 +706,7 @@ func hashStructLenient(
 
 	// Filter message to only include fields that exist in type definition
 	// Also convert numeric types to ensure proper type handling for EIP-712
-	filteredMessage := make(map[string]any)
+	filteredMessage := make(map[string]any, len(types))
 	for _, t := range types {
 		if val, ok := message[t.Name]; ok {
 			// Convert numeric types to ensure proper type handling for EIP-712
@@ -560,11 +759,11 @@ func hashStructLenient(
 					uintVal = parsed
 				default:
 					// Try to convert via json marshal/unmarshal to handle edge cases
-					jsonBytes, err := json.Marshal(v)
+					jsonBytes, err := jsonCodec.Marshal(v)
 					if err != nil {
 						return nil, fmt.Errorf("failed to marshal value for %s: %w", t.Name, err)
 					}
-					if err := json.Unmarshal(jsonBytes, &uintVal); err != nil {
+					if err := jsonCodec.Unmarshal(jsonBytes, &uintVal); err != nil {
 						return nil, fmt.Errorf(
 							"failed to convert value to uint64 for %s: %w",
 							t.Name,
@@ -585,25 +784,98 @@ func hashStructLenient(
 	return typedData.HashStruct(primaryType, filteredMessage)
 }
 
-func signInner(
-	privateKey *ecdsa.PrivateKey,
-	typedData apitypes.TypedData,
-) (SignatureResult, error) {
-	// Create EIP-712 hash
-	domainSeparator, err := typedData.HashStruct("EIP712Domain", typedData.Domain.Map())
-	if err != nil {
-		return SignatureResult{}, fmt.Errorf("failed to hash domain: %w", err)
+// The EIP-712 domains used by Hyperliquid are constant, so their separators
+// are computed once at package init instead of on every signature. This
+// removes a per-call map allocation (TypedDataDomain.Map), a reflection-based
+// HashStruct and a keccak round from the hot path.
+var (
+	l1Domain = apitypes.TypedDataDomain{
+		Name:              "Exchange",
+		Version:           "1",
+		ChainId:           (*math.HexOrDecimal256)(big.NewInt(1337)),
+		VerifyingContract: "0x0000000000000000000000000000000000000000",
+	}
+	userSignedDomain = apitypes.TypedDataDomain{
+		Name:              "HyperliquidSignTransaction",
+		Version:           "1",
+		ChainId:           (*math.HexOrDecimal256)(big.NewInt(421614)),
+		VerifyingContract: "0x0000000000000000000000000000000000000000",
 	}
 
+	l1DomainSeparator         = computeDomainSeparator(l1Domain)
+	userSignedDomainSeparator = computeDomainSeparator(userSignedDomain)
+)
+
+// computeDomainSeparator hashes a constant EIP-712 domain using the generic
+// apitypes machinery once, guaranteeing byte-identical output with the
+// previous per-call implementation.
+func computeDomainSeparator(domain apitypes.TypedDataDomain) []byte {
+	typedData := apitypes.TypedData{
+		Types: apitypes.Types{
+			"EIP712Domain": []apitypes.Type{
+				{Name: "name", Type: "string"},
+				{Name: "version", Type: "string"},
+				{Name: "chainId", Type: "uint256"},
+				{Name: "verifyingContract", Type: "address"},
+			},
+		},
+		Domain: domain,
+	}
+	sep, err := typedData.HashStruct("EIP712Domain", domain.Map())
+	if err != nil {
+		panic(fmt.Sprintf("failed to hash constant EIP-712 domain %q: %v", domain.Name, err))
+	}
+	return sep
+}
+
+// EIP-712 struct hash precomputation for the fixed L1 "Agent" schema:
+//
+//	Agent(string source,bytes32 connectionId)
+//
+// keccak256(typeHash ‖ keccak256(source) ‖ connectionId) — identical to
+// apitypes.HashStruct but without maps/reflection on the hot path.
+var (
+	agentTypeHash          = crypto.Keccak256([]byte("Agent(string source,bytes32 connectionId)"))
+	agentSourceHashMainnet = crypto.Keccak256([]byte("a"))
+	agentSourceHashTestnet = crypto.Keccak256([]byte("b"))
+)
+
+func agentStructHash(connectionId []byte, isMainnet bool) [32]byte {
+	sourceHash := agentSourceHashTestnet
+	if isMainnet {
+		sourceHash = agentSourceHashMainnet
+	}
+	var buf [96]byte
+	copy(buf[0:32], agentTypeHash)
+	copy(buf[32:64], sourceHash)
+	copy(buf[64:96], connectionId)
+	return crypto.Keccak256Hash(buf[:])
+}
+
+func signInner(
+	privateKey *ecdsa.PrivateKey,
+	domainSeparator []byte,
+	typedData apitypes.TypedData,
+) (SignatureResult, error) {
 	// Use lenient hashing to allow extra fields in message (Python compatibility)
 	typedDataHash, err := hashStructLenient(typedData, typedData.PrimaryType, typedData.Message)
 	if err != nil {
 		return SignatureResult{}, fmt.Errorf("failed to hash typed data: %w", err)
 	}
 
-	rawData := []byte{0x19, 0x01}
+	return signTypedDataHash(privateKey, domainSeparator, typedDataHash)
+}
+
+// signTypedDataHash signs keccak256(0x19 0x01 ‖ domainSeparator ‖ structHash).
+func signTypedDataHash(
+	privateKey *ecdsa.PrivateKey,
+	domainSeparator, structHash []byte,
+) (SignatureResult, error) {
+	rawData := make([]byte, 2, 66)
+	rawData[0] = 0x19
+	rawData[1] = 0x01
 	rawData = append(rawData, domainSeparator...)
-	rawData = append(rawData, typedDataHash...)
+	rawData = append(rawData, structHash...)
 	msgHash := crypto.Keccak256Hash(rawData)
 
 	signature, err := crypto.Sign(msgHash.Bytes(), privateKey)
@@ -611,28 +883,40 @@ func signInner(
 		return SignatureResult{}, fmt.Errorf("failed to sign message: %w", err)
 	}
 
-	// Extract r, s, v components
-	r := new(big.Int).SetBytes(signature[:32])
-	s := new(big.Int).SetBytes(signature[32:64])
-	v := int(signature[64]) + 27
-
-	// DEBUG: Verify signature recovery
-	// pubKey, err := crypto.SigToPub(msgHash.Bytes(), signature)
-	// if err == nil {
-	// 	recoveredAddr := crypto.PubkeyToAddress(*pubKey)
-	// 	expectedAddr := crypto.PubkeyToAddress(privateKey.PublicKey)
-	// 	fmt.Printf("   DEBUG SIGNATURE:\n")
-	// 	fmt.Printf("   Expected address: %s\n", expectedAddr.Hex())
-	// 	fmt.Printf("   Recovered address: %s\n", recoveredAddr.Hex())
-	// 	fmt.Printf("   Match: %v\n", recoveredAddr.Hex() == expectedAddr.Hex())
-	// 	fmt.Printf("   msgHash: %s\n", msgHash.Hex())
-	//}
-
+	// Extract r, s, v components. R/S are formatted as 0x-prefixed minimal hex,
+	// byte-identical to hexutil.EncodeBig but without the big.Int round-trip.
 	return SignatureResult{
-		R: hexutil.EncodeBig(r),
-		S: hexutil.EncodeBig(s),
-		V: v,
+		R: hexEncodeBigEndian(signature[:32]),
+		S: hexEncodeBigEndian(signature[32:64]),
+		V: int(signature[64]) + 27,
 	}, nil
+}
+
+// hexEncodeBigEndian formats a big-endian byte slice as 0x-prefixed hex with
+// no leading zeros ("0x0" for zero), byte-identical to hexutil.EncodeBig.
+// strings.Builder.Grow makes it a single allocation with a zero-copy String().
+func hexEncodeBigEndian(b []byte) string {
+	i := 0
+	for i < len(b) && b[i] == 0 {
+		i++
+	}
+	if i == len(b) {
+		return "0x0"
+	}
+
+	var sb strings.Builder
+	sb.Grow(2 + (len(b)-i)*2)
+	sb.WriteString("0x")
+	const digits = "0123456789abcdef"
+	if first := b[i]; first >= 16 {
+		sb.WriteByte(digits[first>>4])
+	}
+	sb.WriteByte(digits[b[i]&0xf])
+	for _, c := range b[i+1:] {
+		sb.WriteByte(digits[c>>4])
+		sb.WriteByte(digits[c&0xf])
+	}
+	return sb.String()
 }
 
 // SignUserSignedAction signs actions that require direct EIP-712 signing
@@ -658,16 +942,12 @@ func SignUserSignedAction(
 		action["hyperliquidChain"] = "Testnet"
 	}
 
-	// Create typed data
-	// Note: chainId is hardcoded to 421614 just like the Python SDK
-	chainId := math.HexOrDecimal256(*big.NewInt(421614))
+	// Create typed data. The EIP-712 domain (chainId 421614, like the Python
+	// SDK) is constant: its separator is precomputed in
+	// userSignedDomainSeparator and the shared userSignedDomain is assigned
+	// read-only (geth's validate() requires a non-empty domain).
 	typedData := apitypes.TypedData{
-		Domain: apitypes.TypedDataDomain{
-			ChainId:           &chainId,
-			Name:              "HyperliquidSignTransaction",
-			Version:           "1",
-			VerifyingContract: "0x0000000000000000000000000000000000000000",
-		},
+		Domain: userSignedDomain,
 		Types: apitypes.Types{
 			primaryType: payloadTypes,
 			"EIP712Domain": []apitypes.Type{
@@ -683,7 +963,7 @@ func SignUserSignedAction(
 
 	// signInner uses hashStructLenient which filters message to only include
 	// fields declared in payloadTypes, matching Python eth_account behavior
-	return signInner(privateKey, typedData)
+	return signInner(privateKey, userSignedDomainSeparator, typedData)
 }
 
 func SignL1Action(
@@ -696,16 +976,13 @@ func SignL1Action(
 ) (SignatureResult, error) {
 	// Step 1: Create action hash
 	hash := actionHash(action, vaultAddress, timestamp, expiresAfter)
-	// fmt.Printf("[DEBUG] SignL1Action - ActionHash: %x\n", hash)
 
-	// Step 2: Construct phantom agent
-	phantomAgent := constructPhantomAgent(hash, isMainnet)
+	// Step 2: EIP-712 struct hash of the phantom agent (fixed "Agent" schema,
+	// precomputed type/source hashes — no maps or reflection per call).
+	structHash := agentStructHash(hash[:], isMainnet)
 
-	// Step 3: Create l1 payload
-	typedData := l1Payload(phantomAgent, isMainnet)
-
-	// Step 4: Sign using EIP-712
-	return signInner(privateKey, typedData)
+	// Step 3: Sign using EIP-712 with the precomputed constant domain separator
+	return signTypedDataHash(privateKey, l1DomainSeparator, structHash[:])
 }
 
 type signUsdClassTransferAction struct {

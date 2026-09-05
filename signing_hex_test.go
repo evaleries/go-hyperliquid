@@ -1,0 +1,59 @@
+package hyperliquid
+
+import (
+	"math/big"
+	"testing"
+
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/stretchr/testify/require"
+)
+
+// hexEncodeBigEndian must stay byte-identical to hexutil.EncodeBig: the
+// Hyperliquid API compares signatures as strings.
+func TestHexEncodeBigEndianMatchesHexutil(t *testing.T) {
+	cases := [][]byte{
+		{},                       // zero (empty)
+		{0},                      // zero (single)
+		{0, 0, 0},                // zero (multi)
+		{1},                      // smallest non-zero
+		{0x0f},                   // leading zero nibble
+		{0xff},                   // single byte max
+		{0x01, 0x00},             // trailing zero byte
+		{0x00, 0x01},             // leading zero byte
+		{0x00, 0x00, 0x0a, 0xbc}, // zeros + zero-nibble byte
+		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}, // uint64 max
+		{0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}, // high bit set
+		{0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0}, // random-ish
+		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, //
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // 256-bit max
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+			0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+	}
+	for i, in := range cases {
+		want := hexutil.EncodeBig(new(big.Int).SetBytes(in))
+		got := hexEncodeBigEndian(in)
+		require.Equal(t, want, got, "case %d: %x", i, in)
+	}
+}
+
+func BenchmarkHexEncodeBigEndian(b *testing.B) {
+	// Typical 256-bit signature component.
+	v := []byte{
+		0x59, 0x9d, 0x9d, 0xd5, 0x01, 0x7b, 0xa9, 0x25,
+		0xb1, 0xc1, 0x69, 0xc9, 0xe7, 0x0c, 0x38, 0xed,
+		0x73, 0x0b, 0x98, 0x53, 0xbd, 0xa6, 0xa6, 0x63,
+		0x9e, 0xba, 0xa3, 0x7a, 0x58, 0xdb, 0xf9, 0x47,
+	}
+	b.Run("Custom", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = hexEncodeBigEndian(v)
+		}
+	})
+	b.Run("HexutilBigInt", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			_ = hexutil.EncodeBig(new(big.Int).SetBytes(v))
+		}
+	})
+}

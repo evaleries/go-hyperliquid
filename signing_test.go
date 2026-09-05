@@ -293,9 +293,8 @@ func TestDebugActionHash(t *testing.T) {
 	hash := actionHash(action, vaultAddress, timestamp, expiresAfter)
 	t.Logf("Action hash: %x", hash)
 
-	// Debug: Print phantom agent
-	phantomAgent := constructPhantomAgent(hash, isMainnet)
-	t.Logf("Phantom agent: %+v", phantomAgent)
+	// Debug: Print phantom agent struct hash
+	t.Logf("Agent struct hash: %x", agentStructHash(hash[:], isMainnet))
 
 	// Generate signature
 	signature, err := SignL1Action(
@@ -445,6 +444,6 @@ func TestActionHash_CancelWithLargeOrderID(t *testing.T) {
 
 	// Verify the hash is non-zero / non-trivial
 	assert.Len(t, hash1, 32, "keccak256 hash must be 32 bytes")
-	assert.False(t, bytes.Equal(hash1, make([]byte, 32)),
+	assert.False(t, bytes.Equal(hash1[:], make([]byte, 32)),
 		"hash must not be all zeros")
 }
