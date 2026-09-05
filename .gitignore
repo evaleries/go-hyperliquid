@@ -28,6 +28,11 @@ go.work
 # Log files
 *.log
 
+# Benchmark reports and profiles
+bench*.txt
+*.prof
+trace.out
+
 # Environment variables
 .env.*
 .env

@@ -36,6 +36,16 @@ coverage-func: ## Show coverage by function
 	$(GOTEST) -race -coverprofile=coverage.out -covermode=atomic $(shell go list ./... | grep -v examples)
 	$(GOCMD) tool cover -func=coverage.out
 
+bench: ## Run all benchmarks (quick sanity run)
+	$(GOTEST) -run='^$$' -bench=. -benchmem $(shell go list ./... | grep -v examples)
+
+bench-long: ## Run benchmarks with statistical rigor (count=10)
+	$(GOTEST) -run='^$$' -bench=. -benchmem -count=10 $(shell go list ./... | grep -v examples)
+
+bench-compare: ## Compare two benchmark reports: make bench-compare OLD=bench-old.txt NEW=bench-new.txt
+	@which benchstat > /dev/null || (echo "benchstat not found. Install it with: go install golang.org/x/perf/cmd/benchstat@latest" && exit 1)
+	benchstat $(OLD) $(NEW)
+
 examples: ## Run example tests
 	$(GOTEST) -v ./examples/...
 
