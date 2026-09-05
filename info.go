@@ -47,6 +47,20 @@ func NewInfo(
 
 	info.client = newClient(baseURL, info.clientOpts...)
 
+	// Precompile JSON codecs for the common info response types so the first
+	// call doesn't pay sonic's JIT compilation cost. (Meta/SpotMeta are
+	// decoded during construction anyway; this covers the rest.)
+	pretouchJSON(
+		Meta{},
+		SpotMeta{},
+		MetaAndAssetCtxs{},
+		SpotMetaAndAssetCtxs{},
+		[]AssetCtx{},
+		[]SpotAssetCtx{},
+		UserState{},
+		OpenOrder{},
+	)
+
 	if meta == nil {
 		var err error
 		meta, err = info.Meta(ctx)
@@ -156,47 +170,49 @@ func (i *Info) postTimeRangeRequest(
 
 func parseMetaResponse(resp []byte) (*Meta, error) {
 	var meta map[string]json.RawMessage
-	if err := json.Unmarshal(resp, &meta); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &meta); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal meta response: %w", err)
 	}
 
 	var universe []AssetInfo
-	if err := json.Unmarshal(meta["universe"], &universe); err != nil {
+	if err := jsonCodec.Unmarshal(meta["universe"], &universe); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal universe: %w", err)
 	}
 
-	var marginTables [][]any
-	if err := json.Unmarshal(meta["marginTables"], &marginTables); err != nil {
+	// Keep each [id, table] pair raw: decoding into any and re-marshaling would
+	// triple the work (generic DOM -> serialize -> typed parse).
+	var marginTables [][]json.RawMessage
+	if err := jsonCodec.Unmarshal(meta["marginTables"], &marginTables); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal margin tables: %w", err)
 	}
 
 	marginTablesResult := make([]MarginTable, len(marginTables))
 	for i, marginTable := range marginTables {
-		id := marginTable[0].(float64)
-		tableBytes, err := json.Marshal(marginTable[1])
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal margin table data: %w", err)
+		if len(marginTable) != 2 {
+			return nil, fmt.Errorf(
+				"expected [id, table] pair for margin table %d, got %d elements",
+				i,
+				len(marginTable),
+			)
 		}
 
-		var marginTableData map[string]any
-		if err := json.Unmarshal(tableBytes, &marginTableData); err != nil {
+		var id int
+		if err := jsonCodec.Unmarshal(marginTable[0], &id); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal margin table id: %w", err)
+		}
+
+		var tableData struct {
+			Description string       `json:"description"`
+			MarginTiers []MarginTier `json:"marginTiers"`
+		}
+		if err := jsonCodec.Unmarshal(marginTable[1], &tableData); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal margin table data: %w", err)
 		}
 
-		marginTiersBytes, err := json.Marshal(marginTableData["marginTiers"])
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal margin tiers: %w", err)
-		}
-
-		var marginTiers []MarginTier
-		if err := json.Unmarshal(marginTiersBytes, &marginTiers); err != nil {
-			return nil, fmt.Errorf("failed to unmarshal margin tiers: %w", err)
-		}
-
 		marginTablesResult[i] = MarginTable{
-			ID:          int(id),
-			Description: marginTableData["description"].(string),
-			MarginTiers: marginTiers,
+			ID:          id,
+			Description: tableData.Description,
+			MarginTiers: tableData.MarginTiers,
 		}
 	}
 
@@ -205,7 +221,7 @@ func parseMetaResponse(resp []byte) (*Meta, error) {
 	collateralToken := 0
 	if raw, ok := meta["collateralToken"]; ok {
 		var ct int
-		if err := json.Unmarshal(raw, &ct); err == nil {
+		if err := jsonCodec.Unmarshal(raw, &ct); err == nil {
 			collateralToken = ct
 		}
 	}
@@ -244,7 +260,7 @@ func (i *Info) SpotMeta(ctx context.Context) (*SpotMeta, error) {
 	}
 
 	var spotMeta SpotMeta
-	if err := json.Unmarshal(resp, &spotMeta); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &spotMeta); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal spot meta response: %w", err)
 	}
 
@@ -262,19 +278,14 @@ func (i *Info) AllPerpMetas(ctx context.Context) ([]*Meta, error) {
 		return nil, fmt.Errorf("failed to fetch meta: %w", err)
 	}
 
-	var result []any
-	if err := json.Unmarshal(resp, &result); err != nil {
+	var result []json.RawMessage
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal meta and asset contexts: %w", err)
 	}
 
 	allPerpMetas := make([]*Meta, len(result))
 	for i, meta := range result {
-		metaBytes, err := json.Marshal(meta)
-		if err != nil {
-			return nil, fmt.Errorf("failed to marshal meta: %w", err)
-		}
-
-		metaResult, err := parseMetaResponse(metaBytes)
+		metaResult, err := parseMetaResponse(meta)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse meta: %w", err)
 		}
@@ -306,7 +317,7 @@ func (i *Info) UserState(ctx context.Context, address string, dex ...string) (*U
 	}
 
 	var result UserState
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal user state: %w", err)
 	}
 	return &result, nil
@@ -322,7 +333,7 @@ func (i *Info) SpotUserState(ctx context.Context, address string) (*SpotUserStat
 	}
 
 	var result SpotUserState
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal spot user state: %w", err)
 	}
 	return &result, nil
@@ -346,7 +357,7 @@ func (i *Info) OpenOrders(ctx context.Context, address string, dex ...string) ([
 	}
 
 	var result []OpenOrder
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal open orders: %w", err)
 	}
 	return result, nil
@@ -374,7 +385,7 @@ func (i *Info) FrontendOpenOrders(
 	}
 
 	var result []FrontendOpenOrder
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal frontend open orders: %w", err)
 	}
 	return result, nil
@@ -397,7 +408,7 @@ func (i *Info) AllMids(ctx context.Context, dex ...string) (map[string]string, e
 	}
 
 	var result map[string]string
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal all mids: %w", err)
 	}
 	return result, nil
@@ -418,7 +429,7 @@ func (i *Info) UserFills(ctx context.Context, params UserFillsParams) ([]Fill, e
 	}
 
 	var result []Fill
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal user fills: %w", err)
 	}
 	return result, nil
@@ -434,7 +445,7 @@ func (i *Info) HistoricalOrders(ctx context.Context, address string) ([]OrderQue
 	}
 
 	var result []OrderQueryResponse
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal historical orders: %w", err)
 	}
 	return result, nil
@@ -465,7 +476,7 @@ func (i *Info) UserFillsByTime(
 	}
 
 	var result []Fill
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal user fills by time: %w", err)
 	}
 	return result, nil
@@ -491,8 +502,8 @@ func (i *Info) MetaAndAssetCtxs(
 		return nil, fmt.Errorf("failed to fetch meta and asset contexts: %w", err)
 	}
 
-	var result []any
-	if err := json.Unmarshal(resp, &result); err != nil {
+	var result []json.RawMessage
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal meta and asset contexts: %w", err)
 	}
 
@@ -500,23 +511,13 @@ func (i *Info) MetaAndAssetCtxs(
 		return nil, fmt.Errorf("expected at least 2 elements in response, got %d", len(result))
 	}
 
-	metaBytes, err := json.Marshal(result[0])
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal meta data: %w", err)
-	}
-
-	meta, err := parseMetaResponse(metaBytes)
+	meta, err := parseMetaResponse(result[0])
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse meta: %w", err)
 	}
 
-	ctxsBytes, err := json.Marshal(result[1])
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal ctxs data: %w", err)
-	}
-
 	var ctxs []AssetCtx
-	if err := json.Unmarshal(ctxsBytes, &ctxs); err != nil {
+	if err := jsonCodec.Unmarshal(result[1], &ctxs); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal ctxs: %w", err)
 	}
 
@@ -536,8 +537,8 @@ func (i *Info) SpotMetaAndAssetCtxs(ctx context.Context) (*SpotMetaAndAssetCtxs,
 		return nil, fmt.Errorf("failed to fetch spot meta and asset contexts: %w", err)
 	}
 
-	var result []any
-	if err := json.Unmarshal(resp, &result); err != nil {
+	var result []json.RawMessage
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal spot meta and asset contexts: %w", err)
 	}
 
@@ -546,24 +547,14 @@ func (i *Info) SpotMetaAndAssetCtxs(ctx context.Context) (*SpotMetaAndAssetCtxs,
 	}
 
 	// Unmarshal the first element (SpotMeta)
-	metaBytes, err := json.Marshal(result[0])
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal meta data: %w", err)
-	}
-
 	var meta SpotMeta
-	if err := json.Unmarshal(metaBytes, &meta); err != nil {
+	if err := jsonCodec.Unmarshal(result[0], &meta); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal meta: %w", err)
 	}
 
 	// Unmarshal the second element ([]SpotAssetCtx)
-	ctxsBytes, err := json.Marshal(result[1])
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal ctxs data: %w", err)
-	}
-
 	var ctxs []SpotAssetCtx
-	if err := json.Unmarshal(ctxsBytes, &ctxs); err != nil {
+	if err := jsonCodec.Unmarshal(result[1], &ctxs); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal ctxs: %w", err)
 	}
 
@@ -592,7 +583,7 @@ func (i *Info) FundingHistory(
 	}
 
 	var result []FundingHistory
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal funding history: %w", err)
 	}
 	return result, nil
@@ -610,7 +601,7 @@ func (i *Info) UserFundingHistory(
 	}
 
 	var result []UserFundingHistory
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal user funding history: %w", err)
 	}
 	return result, nil
@@ -635,7 +626,7 @@ func (i *Info) UserNonFundingLedgerUpdates(
 	}
 
 	var result []UserNonFundingLedgerUpdates
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal user non-funding ledger updates: %w", err)
 	}
 	return result, nil
@@ -651,7 +642,7 @@ func (i *Info) L2Snapshot(ctx context.Context, name string) (*L2Book, error) {
 	}
 
 	var result L2Book
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal L2 snapshot: %w", err)
 	}
 	return &result, nil
@@ -678,7 +669,7 @@ func (i *Info) CandlesSnapshot(
 	}
 
 	var result []Candle
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal candles snapshot: %w", err)
 	}
 	return result, nil
@@ -694,7 +685,7 @@ func (i *Info) UserFees(ctx context.Context, address string) (*UserFees, error) 
 	}
 
 	var result UserFees
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal user fees: %w", err)
 	}
 	return &result, nil
@@ -715,7 +706,7 @@ func (i *Info) UserActiveAssetData(
 	}
 
 	var result UserActiveAssetData
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal user active asset data: %w", err)
 	}
 	return &result, nil
@@ -731,7 +722,7 @@ func (i *Info) UserStakingSummary(ctx context.Context, address string) (*Staking
 	}
 
 	var result StakingSummary
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal staking summary: %w", err)
 	}
 	return &result, nil
@@ -750,7 +741,7 @@ func (i *Info) UserStakingDelegations(
 	}
 
 	var result []StakingDelegation
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal staking delegations: %w", err)
 	}
 	return result, nil
@@ -766,7 +757,7 @@ func (i *Info) UserStakingRewards(ctx context.Context, address string) ([]Stakin
 	}
 
 	var result []StakingReward
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal staking rewards: %w", err)
 	}
 	return result, nil
@@ -787,7 +778,7 @@ func (i *Info) QueryOrderByOid(
 	}
 
 	var result OrderQueryResult
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal order status: %w", err)
 	}
 	return &result, nil
@@ -807,7 +798,7 @@ func (i *Info) QueryOrderByCloid(
 	}
 
 	var result OrderQueryResult
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal order status: %w", err)
 	}
 	return &result, nil
@@ -823,7 +814,7 @@ func (i *Info) QueryReferralState(ctx context.Context, user string) (*ReferralSt
 	}
 
 	var result ReferralState
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal referral state: %w", err)
 	}
 	return &result, nil
@@ -839,7 +830,7 @@ func (i *Info) QuerySubAccounts(ctx context.Context, user string) ([]SubAccount,
 	}
 
 	var result []SubAccount
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal sub accounts: %w", err)
 	}
 	return result, nil
@@ -858,7 +849,7 @@ func (i *Info) QueryUserToMultiSigSigners(
 	}
 
 	var result []MultiSigSigner
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal multi-sig signers: %w", err)
 	}
 	return result, nil
@@ -876,7 +867,7 @@ func (i *Info) PerpDexs(ctx context.Context) (MixedArray, error) {
 	}
 
 	var result MixedArray
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal perp dexs: %w", err)
 	}
 	return result, nil
@@ -892,7 +883,7 @@ func (i *Info) TokenDetails(ctx context.Context, tokenId string) (*TokenDetail, 
 	}
 
 	var tokenDetail TokenDetail
-	if err := json.Unmarshal(resp, &tokenDetail); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &tokenDetail); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal token detail response: %w", err)
 	}
 
@@ -915,7 +906,7 @@ func (i *Info) PerpDexLimits(ctx context.Context, dex string) (*PerpDexLimits, e
 	}
 
 	var result PerpDexLimits
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal perp dex limits: %w", err)
 	}
 	return &result, nil
@@ -937,7 +928,7 @@ func (i *Info) PerpDexStatus(ctx context.Context, dex string) (*PerpDexStatus, e
 	}
 
 	var result PerpDexStatus
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal perp dex status: %w", err)
 	}
 	return &result, nil
@@ -953,7 +944,7 @@ func (i *Info) PerpDeployAuctionStatus(ctx context.Context) (*PerpDeployAuctionS
 	}
 
 	var result PerpDeployAuctionStatus
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal perp deploy auction status: %w", err)
 	}
 	return &result, nil
@@ -970,7 +961,7 @@ func (i *Info) Portfolio(ctx context.Context, user string) ([]Portfolio, error) 
 	}
 
 	var result []Portfolio
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal portfolio: %w", err)
 	}
 	return result, nil
@@ -987,7 +978,7 @@ func (i *Info) QueryUserAbstractionState(ctx context.Context, user string) (stri
 	}
 
 	var state string
-	if err := json.Unmarshal(resp, &state); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &state); err != nil {
 		return "", fmt.Errorf("failed to unmarshal state: %w", err)
 	}
 	return state, nil
@@ -1004,7 +995,7 @@ func (i *Info) QueryUserDexAbstractionState(ctx context.Context, user string) (s
 	}
 
 	var state string
-	if err := json.Unmarshal(resp, &state); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &state); err != nil {
 		return "", fmt.Errorf("failed to unmarshal state: %w", err)
 	}
 	return state, nil
@@ -1021,7 +1012,7 @@ func (i *Info) QueryUserVaultEquities(ctx context.Context, user string) ([]Vault
 	}
 
 	var result []VaultEquity
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal VaultEquity: %w", err)
 	}
 	return result, nil
@@ -1040,7 +1031,7 @@ func (i *Info) QueryVaultDetails(ctx context.Context, VaultAddress string, user 
 	}
 
 	var result VaultDetails
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal vault details: %w", err)
 	}
 	return &result, nil
@@ -1057,7 +1048,7 @@ func (i *Info) OutcomeMeta(ctx context.Context) (*OutcomeMeta, error) {
 	}
 
 	var result OutcomeMeta
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal outcome meta: %w", err)
 	}
 	return &result, nil
@@ -1074,7 +1065,7 @@ func (i *Info) AllBorrowLendReserveStates(ctx context.Context) ([]BorrowLendRese
 	}
 
 	var result []BorrowLendReserveStates
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal all borrow/lend reserve states: %w", err)
 	}
 	return result, nil
@@ -1092,7 +1083,7 @@ func (i *Info) BorrowLendUserState(ctx context.Context, user string) (*BorrowLen
 	}
 
 	var result BorrowLendUserState
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal borrow/lend user state: %w", err)
 	}
 	return &result, nil
@@ -1109,7 +1100,7 @@ func (i *Info) ApprovedBuilders(ctx context.Context, user string) ([]string, err
 		return nil, fmt.Errorf("failed to fetch approved builders: %w", err)
 	}
 	var result []string
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal approved builders: %w", err)
 	}
 	return result, nil
@@ -1126,7 +1117,7 @@ func (i *Info) ExtraAgents(ctx context.Context, user string) ([]ExtraAgents, err
 		return nil, fmt.Errorf("failed to fetch extra agents: %w", err)
 	}
 	var result []ExtraAgents
-	if err := json.Unmarshal(resp, &result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
 		return nil, fmt.Errorf("failed to unmarshal extra agents: %w", err)
 	}
 	return result, nil

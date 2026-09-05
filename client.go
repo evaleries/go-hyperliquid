@@ -21,6 +21,11 @@ const (
 
 	// httpErrorStatusCode is the minimum status code considered an error
 	httpErrorStatusCode = 400
+
+	// maxPreallocBodyHint caps the Content-Length-based body preallocation.
+	// Legitimate responses are at most a few MB; the cap prevents a hostile
+	// endpoint from forcing an oversized allocation via a bogus header.
+	maxPreallocBodyHint = 64 << 20
 )
 
 type client struct {
@@ -48,7 +53,7 @@ func newClient(baseURL string, opts ...ClientOpt) *client {
 }
 
 func (c *client) post(ctx context.Context, path string, payload any) ([]byte, error) {
-	jsonData, err := json.Marshal(payload)
+	jsonData, err := jsonCodec.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal payload: %w", err)
 	}
@@ -83,9 +88,22 @@ func (c *client) post(ctx context.Context, path string, payload any) ([]byte, er
 
 	body := make([]byte, 0)
 	if resp.Body != nil {
-		body, err = io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read response body: %w", err)
+		// Preallocate from Content-Length when known: io.ReadAll starts at
+		// 512 bytes and repeatedly regrows, which copies a large (e.g.
+		// metaAndAssetCtxs ~500KB) response ~10 times over. The hint is capped
+		// so a malicious/buggy server can't force a giant upfront allocation.
+		if resp.ContentLength > 0 && resp.ContentLength <= maxPreallocBodyHint {
+			var buf bytes.Buffer
+			buf.Grow(int(resp.ContentLength))
+			if _, err = buf.ReadFrom(resp.Body); err != nil {
+				return nil, fmt.Errorf("failed to read response body: %w", err)
+			}
+			body = buf.Bytes()
+		} else {
+			body, err = io.ReadAll(resp.Body)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read response body: %w", err)
+			}
 		}
 	}
 
@@ -101,7 +119,7 @@ func (c *client) post(ctx context.Context, path string, payload any) ([]byte, er
 			return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 		}
 		var apiErr APIError
-		if err := json.Unmarshal(body, &apiErr); err != nil {
+		if err := jsonCodec.Unmarshal(body, &apiErr); err != nil {
 			return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 		}
 		return nil, apiErr
