@@ -56,13 +56,20 @@ func NewExchange(
 	ex.client = newClient(baseURL, ex.clientOpts...)
 	ex.info = NewInfo(ctx, baseURL, true, meta, spotMeta, perpDexs, ex.infoOpts...)
 
-	// Precompile JSON codecs for the hot trading actions and their responses
-	// so the first order doesn't pay sonic's JIT compilation cost.
+	// Precompile JSON codecs for the hot trading actions, the response
+	// envelopes executeAction actually decodes, and the envelopes' inner
+	// data types, so the first order doesn't pay sonic's JIT compilation
+	// cost. (APIResponse.UnmarshalJSON decodes its Data field with jsonCodec,
+	// so OrderResponse/CancelOrderResponse are pretouched alongside their
+	// envelopes.)
 	pretouchJSON(
 		OrderAction{},
+		APIResponse[OrderResponse]{},
 		OrderResponse{},
 		CancelAction{},
 		CancelByCloidAction{},
+		APIResponse[CancelOrderResponse]{},
+		CancelOrderResponse{},
 		BatchModifyAction{},
 		UpdateLeverageAction{},
 		UpdateIsolatedMarginAction{},

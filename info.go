@@ -47,18 +47,25 @@ func NewInfo(
 
 	info.client = newClient(baseURL, info.clientOpts...)
 
-	// Precompile JSON codecs for the common info response types so the first
-	// call doesn't pay sonic's JIT compilation cost. (Meta/SpotMeta are
-	// decoded during construction anyway; this covers the rest.)
+	// Precompile JSON codecs for the types actually decoded on the hot info
+	// paths so the first call doesn't pay sonic's JIT compilation cost.
+	// Meta/MetaAndAssetCtxs/SpotMetaAndAssetCtxs are built by hand
+	// (parseMetaResponse and the two-phase tuple decoders), never decoded
+	// directly, so their inner decode targets ([]AssetInfo, SpotMeta,
+	// []AssetCtx, []SpotAssetCtx) are pretouched instead. Slices are listed
+	// where a slice is the decode target: a slice codec is a separate sonic
+	// program from its element's.
 	pretouchJSON(
-		Meta{},
 		SpotMeta{},
-		MetaAndAssetCtxs{},
-		SpotMetaAndAssetCtxs{},
+		[]AssetInfo{},
 		[]AssetCtx{},
 		[]SpotAssetCtx{},
 		UserState{},
-		OpenOrder{},
+		[]OpenOrder{},
+		[]Fill{},
+		[]Candle{},
+		L2Book{},
+		map[string]string{},
 	)
 
 	if meta == nil {
@@ -168,6 +175,38 @@ func (i *Info) postTimeRangeRequest(
 	return resp, nil
 }
 
+// postInfo posts payload to the /info endpoint and decodes the response body
+// into T. what words the wrapped errors ("failed to fetch <what>" / "failed to
+// unmarshal <what>"); pass a second wording when an endpoint's historical
+// fetch and decode messages differ (e.g. "token detail" / "token detail
+// response"). On error the zero value of T is returned, matching the
+// nil-on-error contract of the hand-rolled endpoints.
+func postInfo[T any](
+	ctx context.Context,
+	c *client,
+	payload any,
+	what string,
+	decodeWording ...string,
+) (T, error) {
+	decodeWhat := what
+	if len(decodeWording) > 0 {
+		decodeWhat = decodeWording[0]
+	}
+
+	var result T
+	resp, err := c.post(ctx, "/info", payload)
+	if err != nil {
+		return result, fmt.Errorf("failed to fetch %s: %w", what, err)
+	}
+	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
+		// A failed decode may have partially populated result; callers must
+		// observe the same zero value the hand-rolled endpoints returned.
+		var zero T
+		return zero, fmt.Errorf("failed to unmarshal %s: %w", decodeWhat, err)
+	}
+	return result, nil
+}
+
 func parseMetaResponse(resp []byte) (*Meta, error) {
 	var meta map[string]json.RawMessage
 	if err := jsonCodec.Unmarshal(resp, &meta); err != nil {
@@ -252,16 +291,10 @@ func (i *Info) Meta(ctx context.Context, dex ...string) (*Meta, error) {
 }
 
 func (i *Info) SpotMeta(ctx context.Context) (*SpotMeta, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
-		"type": "spotMeta",
-	})
+	payload := map[string]any{"type": "spotMeta"}
+	spotMeta, err := postInfo[SpotMeta](ctx, i.client, payload, "spot meta", "spot meta response")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch spot meta: %w", err)
-	}
-
-	var spotMeta SpotMeta
-	if err := jsonCodec.Unmarshal(resp, &spotMeta); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal spot meta response: %w", err)
+		return nil, err
 	}
 
 	return &spotMeta, nil
@@ -311,30 +344,21 @@ func (i *Info) UserState(ctx context.Context, address string, dex ...string) (*U
 		payload["dex"] = dex[0]
 	}
 
-	resp, err := i.client.post(ctx, "/info", payload)
+	result, err := postInfo[UserState](ctx, i.client, payload, "user state")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user state: %w", err)
-	}
-
-	var result UserState
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal user state: %w", err)
+		return nil, err
 	}
 	return &result, nil
 }
 
 func (i *Info) SpotUserState(ctx context.Context, address string) (*SpotUserState, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "spotClearinghouseState",
 		"user": address,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch spot user state: %w", err)
 	}
-
-	var result SpotUserState
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal spot user state: %w", err)
+	result, err := postInfo[SpotUserState](ctx, i.client, payload, "spot user state")
+	if err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
@@ -351,16 +375,7 @@ func (i *Info) OpenOrders(ctx context.Context, address string, dex ...string) ([
 		payload["dex"] = dex[0]
 	}
 
-	resp, err := i.client.post(ctx, "/info", payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch open orders: %w", err)
-	}
-
-	var result []OpenOrder
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal open orders: %w", err)
-	}
-	return result, nil
+	return postInfo[[]OpenOrder](ctx, i.client, payload, "open orders")
 }
 
 // FrontendOpenOrders retrieves user's open orders with frontend info
@@ -379,16 +394,7 @@ func (i *Info) FrontendOpenOrders(
 		payload["dex"] = dex[0]
 	}
 
-	resp, err := i.client.post(ctx, "/info", payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch frontend open orders: %w", err)
-	}
-
-	var result []FrontendOpenOrder
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal frontend open orders: %w", err)
-	}
-	return result, nil
+	return postInfo[[]FrontendOpenOrder](ctx, i.client, payload, "frontend open orders")
 }
 
 // AllMids retrieves mids for all coins
@@ -402,16 +408,7 @@ func (i *Info) AllMids(ctx context.Context, dex ...string) (map[string]string, e
 		payload["dex"] = dex[0]
 	}
 
-	resp, err := i.client.post(ctx, "/info", payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch all mids: %w", err)
-	}
-
-	var result map[string]string
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal all mids: %w", err)
-	}
-	return result, nil
+	return postInfo[map[string]string](ctx, i.client, payload, "all mids")
 }
 
 func (i *Info) UserFills(ctx context.Context, params UserFillsParams) ([]Fill, error) {
@@ -423,32 +420,15 @@ func (i *Info) UserFills(ctx context.Context, params UserFillsParams) ([]Fill, e
 		payload["aggregateByTime"] = *params.AggregateByTime
 	}
 
-	resp, err := i.client.post(ctx, "/info", payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user fills: %w", err)
-	}
-
-	var result []Fill
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal user fills: %w", err)
-	}
-	return result, nil
+	return postInfo[[]Fill](ctx, i.client, payload, "user fills")
 }
 
 func (i *Info) HistoricalOrders(ctx context.Context, address string) ([]OrderQueryResponse, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "historicalOrders",
 		"user": address,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch historical orders: %w", err)
 	}
-
-	var result []OrderQueryResponse
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal historical orders: %w", err)
-	}
-	return result, nil
+	return postInfo[[]OrderQueryResponse](ctx, i.client, payload, "historical orders")
 }
 
 func (i *Info) UserFillsByTime(
@@ -633,17 +613,13 @@ func (i *Info) UserNonFundingLedgerUpdates(
 }
 
 func (i *Info) L2Snapshot(ctx context.Context, name string) (*L2Book, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "l2Book",
 		"coin": name,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch L2 snapshot: %w", err)
 	}
-
-	var result L2Book
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal L2 snapshot: %w", err)
+	result, err := postInfo[L2Book](ctx, i.client, payload, "L2 snapshot")
+	if err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
@@ -660,33 +636,21 @@ func (i *Info) CandlesSnapshot(
 		"endTime":   endTime,
 	}
 
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "candleSnapshot",
 		"req":  req,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch candles snapshot: %w", err)
 	}
-
-	var result []Candle
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal candles snapshot: %w", err)
-	}
-	return result, nil
+	return postInfo[[]Candle](ctx, i.client, payload, "candles snapshot")
 }
 
 func (i *Info) UserFees(ctx context.Context, address string) (*UserFees, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "userFees",
 		"user": address,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user fees: %w", err)
 	}
-
-	var result UserFees
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal user fees: %w", err)
+	result, err := postInfo[UserFees](ctx, i.client, payload, "user fees")
+	if err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
@@ -696,34 +660,26 @@ func (i *Info) UserActiveAssetData(
 	address string,
 	coin string,
 ) (*UserActiveAssetData, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "activeAssetData",
 		"user": address,
 		"coin": coin,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch user active asset data: %w", err)
 	}
-
-	var result UserActiveAssetData
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal user active asset data: %w", err)
+	result, err := postInfo[UserActiveAssetData](ctx, i.client, payload, "user active asset data")
+	if err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
 
 func (i *Info) UserStakingSummary(ctx context.Context, address string) (*StakingSummary, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "delegatorSummary",
 		"user": address,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch staking summary: %w", err)
 	}
-
-	var result StakingSummary
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal staking summary: %w", err)
+	result, err := postInfo[StakingSummary](ctx, i.client, payload, "staking summary")
+	if err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
@@ -732,35 +688,19 @@ func (i *Info) UserStakingDelegations(
 	ctx context.Context,
 	address string,
 ) ([]StakingDelegation, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "delegations",
 		"user": address,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch staking delegations: %w", err)
 	}
-
-	var result []StakingDelegation
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal staking delegations: %w", err)
-	}
-	return result, nil
+	return postInfo[[]StakingDelegation](ctx, i.client, payload, "staking delegations")
 }
 
 func (i *Info) UserStakingRewards(ctx context.Context, address string) ([]StakingReward, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "delegatorRewards",
 		"user": address,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch staking rewards: %w", err)
 	}
-
-	var result []StakingReward
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal staking rewards: %w", err)
-	}
-	return result, nil
+	return postInfo[[]StakingReward](ctx, i.client, payload, "staking rewards")
 }
 
 func (i *Info) QueryOrderByOid(
@@ -768,18 +708,14 @@ func (i *Info) QueryOrderByOid(
 	user string,
 	oid int64,
 ) (*OrderQueryResult, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "orderStatus",
 		"user": user,
 		"oid":  oid,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch order status: %w", err)
 	}
-
-	var result OrderQueryResult
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal order status: %w", err)
+	result, err := postInfo[OrderQueryResult](ctx, i.client, payload, "order status")
+	if err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
@@ -788,103 +724,65 @@ func (i *Info) QueryOrderByCloid(
 	ctx context.Context,
 	user, cloid string,
 ) (*OrderQueryResult, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "orderStatus",
 		"user": user,
 		"oid":  cloid,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch order status by cloid: %w", err)
 	}
-
-	var result OrderQueryResult
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal order status: %w", err)
+	result, err := postInfo[OrderQueryResult](ctx, i.client, payload, "order status by cloid", "order status")
+	if err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
 
 func (i *Info) QueryReferralState(ctx context.Context, user string) (*ReferralState, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "referral",
 		"user": user,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch referral state: %w", err)
 	}
-
-	var result ReferralState
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal referral state: %w", err)
+	result, err := postInfo[ReferralState](ctx, i.client, payload, "referral state")
+	if err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
 
 func (i *Info) QuerySubAccounts(ctx context.Context, user string) ([]SubAccount, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "subAccounts",
 		"user": user,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch sub accounts: %w", err)
 	}
-
-	var result []SubAccount
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal sub accounts: %w", err)
-	}
-	return result, nil
+	return postInfo[[]SubAccount](ctx, i.client, payload, "sub accounts")
 }
 
 func (i *Info) QueryUserToMultiSigSigners(
 	ctx context.Context,
 	multiSigUser string,
 ) ([]MultiSigSigner, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "userToMultiSigSigners",
 		"user": multiSigUser,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch multi-sig signers: %w", err)
 	}
-
-	var result []MultiSigSigner
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal multi-sig signers: %w", err)
-	}
-	return result, nil
+	return postInfo[[]MultiSigSigner](ctx, i.client, payload, "multi-sig signers")
 }
 
 // PerpDexs returns the list of available perpetual dexes
 // Returns an array where each element can be nil (for the default dex) or a PerpDex object
 // The first element is always null (representing the default dex)
 func (i *Info) PerpDexs(ctx context.Context) (MixedArray, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
-		"type": "perpDexs",
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch perp dexs: %w", err)
-	}
-
-	var result MixedArray
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal perp dexs: %w", err)
-	}
-	return result, nil
+	payload := map[string]any{"type": "perpDexs"}
+	return postInfo[MixedArray](ctx, i.client, payload, "perp dexs")
 }
 
 func (i *Info) TokenDetails(ctx context.Context, tokenId string) (*TokenDetail, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type":    "tokenDetails",
 		"tokenId": tokenId,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch token detail: %w", err)
 	}
-
-	var tokenDetail TokenDetail
-	if err := jsonCodec.Unmarshal(resp, &tokenDetail); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal token detail response: %w", err)
+	tokenDetail, err := postInfo[TokenDetail](ctx, i.client, payload, "token detail", "token detail response")
+	if err != nil {
+		return nil, err
 	}
 
 	return &tokenDetail, nil
@@ -897,17 +795,13 @@ func (i *Info) PerpDexLimits(ctx context.Context, dex string) (*PerpDexLimits, e
 		return nil, fmt.Errorf("dex parameter is required for perpDexLimits")
 	}
 
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "perpDexLimits",
 		"dex":  dex,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch perp dex limits: %w", err)
 	}
-
-	var result PerpDexLimits
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal perp dex limits: %w", err)
+	result, err := postInfo[PerpDexLimits](ctx, i.client, payload, "perp dex limits")
+	if err != nil {
+		return nil, err
 	}
 	return &result, nil
 }
@@ -922,100 +816,57 @@ func (i *Info) PerpDexStatus(ctx context.Context, dex string) (*PerpDexStatus, e
 		payload["dex"] = dex
 	}
 
-	resp, err := i.client.post(ctx, "/info", payload)
+	result, err := postInfo[PerpDexStatus](ctx, i.client, payload, "perp dex status")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch perp dex status: %w", err)
-	}
-
-	var result PerpDexStatus
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal perp dex status: %w", err)
+		return nil, err
 	}
 	return &result, nil
 }
 
 // PerpDeployAuctionStatus retrieves information about the Perp Deploy Auction
 func (i *Info) PerpDeployAuctionStatus(ctx context.Context) (*PerpDeployAuctionStatus, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
-		"type": "perpDeployAuctionStatus",
-	})
+	payload := map[string]any{"type": "perpDeployAuctionStatus"}
+	result, err := postInfo[PerpDeployAuctionStatus](ctx, i.client, payload, "perp deploy auction status")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch perp deploy auction status: %w", err)
-	}
-
-	var result PerpDeployAuctionStatus
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal perp deploy auction status: %w", err)
+		return nil, err
 	}
 	return &result, nil
 }
 
 // portfolio returns the user's portfolio
 func (i *Info) Portfolio(ctx context.Context, user string) ([]Portfolio, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "portfolio",
 		"user": user,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch portfolio: %w", err)
 	}
-
-	var result []Portfolio
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal portfolio: %w", err)
-	}
-	return result, nil
+	return postInfo[[]Portfolio](ctx, i.client, payload, "portfolio")
 }
 
 // QueryUserAbstractionState returns the user's abstraction state
 func (i *Info) QueryUserAbstractionState(ctx context.Context, user string) (string, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "userAbstraction",
 		"user": user,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch state: %w", err)
 	}
-
-	var state string
-	if err := jsonCodec.Unmarshal(resp, &state); err != nil {
-		return "", fmt.Errorf("failed to unmarshal state: %w", err)
-	}
-	return state, nil
+	return postInfo[string](ctx, i.client, payload, "state")
 }
 
 // QueryUserDexAbstractionState returns the user's dex abstraction state
 func (i *Info) QueryUserDexAbstractionState(ctx context.Context, user string) (string, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "userDexAbstraction",
 		"user": user,
-	})
-	if err != nil {
-		return "", fmt.Errorf("failed to fetch state: %w", err)
 	}
-
-	var state string
-	if err := jsonCodec.Unmarshal(resp, &state); err != nil {
-		return "", fmt.Errorf("failed to unmarshal state: %w", err)
-	}
-	return state, nil
+	return postInfo[string](ctx, i.client, payload, "state")
 }
 
 // QueryUserVaultEquities returns Retrieve a user's vault deposits
 func (i *Info) QueryUserVaultEquities(ctx context.Context, user string) ([]VaultEquity, error) {
-	resp, err := i.client.post(ctx, "/info", map[string]any{
+	payload := map[string]any{
 		"type": "userVaultEquities",
 		"user": user,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch VaultEquity: %w", err)
 	}
-
-	var result []VaultEquity
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal VaultEquity: %w", err)
-	}
-	return result, nil
+	return postInfo[[]VaultEquity](ctx, i.client, payload, "VaultEquity")
 }
 
 // QueryVaultDetails returns the details of a vault.
@@ -1025,14 +876,9 @@ func (i *Info) QueryVaultDetails(ctx context.Context, VaultAddress string, user 
 		"vaultAddress": VaultAddress,
 		"user":         user,
 	}
-	resp, err := i.client.post(ctx, "/info", payload)
+	result, err := postInfo[VaultDetails](ctx, i.client, payload, "vault details")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch vault details: %w", err)
-	}
-
-	var result VaultDetails
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal vault details: %w", err)
+		return nil, err
 	}
 	return &result, nil
 }
@@ -1042,14 +888,9 @@ func (i *Info) OutcomeMeta(ctx context.Context) (*OutcomeMeta, error) {
 	payload := map[string]any{
 		"type": "outcomeMeta",
 	}
-	resp, err := i.client.post(ctx, "/info", payload)
+	result, err := postInfo[OutcomeMeta](ctx, i.client, payload, "outcome meta")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch outcome meta: %w", err)
-	}
-
-	var result OutcomeMeta
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal outcome meta: %w", err)
+		return nil, err
 	}
 	return &result, nil
 }
@@ -1059,16 +900,7 @@ func (i *Info) AllBorrowLendReserveStates(ctx context.Context) ([]BorrowLendRese
 	payload := map[string]any{
 		"type": "allBorrowLendReserveStates",
 	}
-	resp, err := i.client.post(ctx, "/info", payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch all borrow/lend reserve states: %w", err)
-	}
-
-	var result []BorrowLendReserveStates
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal all borrow/lend reserve states: %w", err)
-	}
-	return result, nil
+	return postInfo[[]BorrowLendReserveStates](ctx, i.client, payload, "all borrow/lend reserve states")
 }
 
 // BorrowLendUserState returns the details of a borrow/lend user state.
@@ -1077,14 +909,9 @@ func (i *Info) BorrowLendUserState(ctx context.Context, user string) (*BorrowLen
 		"type": "borrowLendUserState",
 		"user": user,
 	}
-	resp, err := i.client.post(ctx, "/info", payload)
+	result, err := postInfo[BorrowLendUserState](ctx, i.client, payload, "borrow/lend user state")
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch borrow/lend user state: %w", err)
-	}
-
-	var result BorrowLendUserState
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal borrow/lend user state: %w", err)
+		return nil, err
 	}
 	return &result, nil
 }
@@ -1095,15 +922,7 @@ func (i *Info) ApprovedBuilders(ctx context.Context, user string) ([]string, err
 		"type": "approvedBuilders",
 		"user": user,
 	}
-	resp, err := i.client.post(ctx, "/info", payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch approved builders: %w", err)
-	}
-	var result []string
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal approved builders: %w", err)
-	}
-	return result, nil
+	return postInfo[[]string](ctx, i.client, payload, "approved builders")
 }
 
 // Retrieve extra agents associated with a user
@@ -1112,13 +931,5 @@ func (i *Info) ExtraAgents(ctx context.Context, user string) ([]ExtraAgents, err
 		"type": "extraAgents",
 		"user": user,
 	}
-	resp, err := i.client.post(ctx, "/info", payload)
-	if err != nil {
-		return nil, fmt.Errorf("failed to fetch extra agents: %w", err)
-	}
-	var result []ExtraAgents
-	if err := jsonCodec.Unmarshal(resp, &result); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal extra agents: %w", err)
-	}
-	return result, nil
+	return postInfo[[]ExtraAgents](ctx, i.client, payload, "extra agents")
 }
