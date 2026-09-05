@@ -20,561 +20,65 @@ import (
 	"github.com/vmihailenco/msgpack/v5"
 )
 
-// convertStr16ToStr8 converts msgpack str16 (0xda + 2 byte length) to str8 (0xd9 + 1 byte length)
-// for strings <256 bytes to match Python msgpack behavior.
-// Uses a structure-aware msgpack walker to avoid corrupting non-string data
-// that happens to contain 0xda as a data byte (e.g. inside uint64 values).
-func convertStr16ToStr8(data []byte) []byte {
-	return convertStr16ToStr8Extra(data, 0)
-}
-
-// convertStr16ToStr8Extra is convertStr16ToStr8 with extra reserved capacity,
-// so callers that append a trailer to the result avoid a reallocation.
+// actionEncoder pairs a pooled msgpack buffer with its encoder so a single
+// Get/Put covers both and exactly one place owns the encoder options.
 //
-// When the payload contains no convertible str16 header (the common case),
-// the input is returned as-is: no copy, no allocation. Callers must not rely
-// on receiving an independent copy.
-func convertStr16ToStr8Extra(data []byte, extraCap int) []byte {
-	if !msgpackNeedsStr16Conversion(data) {
-		return data
-	}
-	result := make([]byte, 0, len(data)+extraCap)
-	pos := 0
-	for pos < len(data) {
-		consumed := walkMsgpackValue(data, pos, &result)
-		if consumed <= 0 {
-			// Malformed data: copy remaining bytes as-is (fail-safe)
-			result = append(result, data[pos:]...)
-			break
-		}
-		pos += consumed
-	}
-	return result
+// CRITICAL: msgpack's Encoder.Reset zeroes every encoder flag (v5
+// encode.go: ResetDict sets e.flags = 0), so UseCompactInts MUST be
+// re-armed after each Reset. Without it, sized integer fields (int64,
+// *int64, any-boxed int64 — e.g. CancelOrderWire.OrderID,
+// ScheduleCancelAction.Time, ModifyAction.Oid) encode full-width instead of
+// compact, which changes the action hash and therefore the signature.
+// Plain `int` fields are compact unconditionally, which is why order
+// placement is insensitive to the flag but cancel/modify are not.
+type actionEncoder struct {
+	buf *bytes.Buffer
+	enc *msgpack.Encoder
 }
 
-// msgpackNeedsStr16Conversion reports whether data contains a str16 header
-// for a string shorter than 256 bytes (the only case convertStr16ToStr8
-// rewrites). It mirrors walkMsgpackValue structurally but writes nothing.
-// Malformed data returns true so callers take the copying fail-safe path.
-func msgpackNeedsStr16Conversion(data []byte) bool {
-	pos := 0
-	for pos < len(data) {
-		convertible, consumed := scanMsgpackValue(data, pos)
-		if convertible {
-			return true
-		}
-		if consumed <= 0 {
-			return true // malformed: let the copying path handle it
-		}
-		pos += consumed
-	}
-	return false
-}
-
-// scanMsgpackValue is the write-free twin of walkMsgpackValue: it parses one
-// msgpack value at data[pos] and returns (true, n) when the value itself is a
-// convertible str16 consuming n bytes, or (false, n) otherwise. A (false, 0)
-// result marks truncated/malformed data. For container values the walk
-// short-circuits on the first convertible child (consumed is then invalid,
-// but callers only use it when the result is false).
-func scanMsgpackValue(data []byte, pos int) (bool, int) {
-	if pos >= len(data) {
-		return false, 0
-	}
-	b := data[pos]
-	remaining := len(data) - pos
-
-	// --- Fixed-length single-byte types ---
-	if b <= 0x7f || b >= 0xe0 || (b >= 0xc0 && b <= 0xc3) {
-		return false, 1
-	}
-
-	// scanChildren walks count nested values starting after a headerSize-byte
-	// container header, short-circuiting on the first convertible child.
-	scanChildren := func(headerSize, count int) (bool, int) {
-		if remaining < headerSize {
-			return false, 0
-		}
-		consumed := headerSize
-		for i := 0; i < count; i++ {
-			conv, c := scanMsgpackValue(data, pos+consumed)
-			if conv {
-				return true, 0
-			}
-			if c <= 0 {
-				return false, 0
-			}
-			consumed += c
-		}
-		return false, consumed
-	}
-
-	// --- fixstr (0xa0-0xbf) ---
-	if b >= 0xa0 && b <= 0xbf {
-		n := int(b & 0x1f)
-		if remaining < 1+n {
-			return false, 0
-		}
-		return false, 1 + n
-	}
-
-	// --- fixmap (0x80-0x8f) ---
-	if b >= 0x80 && b <= 0x8f {
-		return scanChildren(1, int(b&0x0f)*2)
-	}
-
-	// --- fixarray (0x90-0x9f) ---
-	if b >= 0x90 && b <= 0x9f {
-		return scanChildren(1, int(b&0x0f))
-	}
-
-	switch b {
-	case 0xca: // float32: 1+4
-		return false, scanFixed(data, pos, 5)
-	case 0xcb: // float64: 1+8
-		return false, scanFixed(data, pos, 9)
-
-	// --- unsigned integers ---
-	case 0xcc:
-		return false, scanFixed(data, pos, 2)
-	case 0xcd:
-		return false, scanFixed(data, pos, 3)
-	case 0xce:
-		return false, scanFixed(data, pos, 5)
-	case 0xcf:
-		return false, scanFixed(data, pos, 9)
-
-	// --- signed integers ---
-	case 0xd0:
-		return false, scanFixed(data, pos, 2)
-	case 0xd1:
-		return false, scanFixed(data, pos, 3)
-	case 0xd2:
-		return false, scanFixed(data, pos, 5)
-	case 0xd3:
-		return false, scanFixed(data, pos, 9)
-
-	// --- fixext 1/2/4/8/16 ---
-	case 0xd4:
-		return false, scanFixed(data, pos, 3)
-	case 0xd5:
-		return false, scanFixed(data, pos, 4)
-	case 0xd6:
-		return false, scanFixed(data, pos, 6)
-	case 0xd7:
-		return false, scanFixed(data, pos, 10)
-	case 0xd8:
-		return false, scanFixed(data, pos, 18)
-
-	// --- bin 8/16/32 ---
-	case 0xc4:
-		return false, scanVarLen(data, pos, 1)
-	case 0xc5:
-		return false, scanVarLen(data, pos, 2)
-	case 0xc6:
-		return false, scanVarLen(data, pos, 4)
-
-	// --- ext 8/16/32 ---
-	case 0xc7:
-		return false, scanExtVarLen(data, pos, 1)
-	case 0xc8:
-		return false, scanExtVarLen(data, pos, 2)
-	case 0xc9:
-		return false, scanExtVarLen(data, pos, 4)
-
-	// --- str8: already compact ---
-	case 0xd9:
-		return false, scanVarLen(data, pos, 1)
-
-	// --- str16 (0xda): THE conversion target ---
-	case 0xda:
-		if remaining < 3 {
-			return false, 0
-		}
-		length := (int(data[pos+1]) << 8) | int(data[pos+2])
-		total := 3 + length
-		if remaining < total {
-			return false, 0
-		}
-		return length < 256, total
-
-	// --- str32 ---
-	case 0xdb:
-		return false, scanVarLen(data, pos, 4)
-
-	// --- array16/32 ---
-	case 0xdc:
-		if remaining < 3 {
-			return false, 0
-		}
-		count := (int(data[pos+1]) << 8) | int(data[pos+2])
-		return scanChildren(3, count)
-	case 0xdd:
-		if remaining < 5 {
-			return false, 0
-		}
-		count := (int(data[pos+1]) << 24) | (int(data[pos+2]) << 16) | (int(data[pos+3]) << 8) | int(data[pos+4])
-		return scanChildren(5, count)
-
-	// --- map16/32 ---
-	case 0xde:
-		if remaining < 3 {
-			return false, 0
-		}
-		count := (int(data[pos+1]) << 8) | int(data[pos+2])
-		return scanChildren(3, count*2)
-	case 0xdf:
-		if remaining < 5 {
-			return false, 0
-		}
-		count := (int(data[pos+1]) << 24) | (int(data[pos+2]) << 16) | (int(data[pos+3]) << 8) | int(data[pos+4])
-		return scanChildren(5, count*2)
-
-	default:
-		return false, 1
-	}
-}
-
-// scanFixed mirrors copyFixed without writing.
-func scanFixed(data []byte, pos, size int) int {
-	if len(data)-pos < size {
-		return 0
-	}
-	return size
-}
-
-// scanVarLen mirrors copyVarLen without writing.
-func scanVarLen(data []byte, pos, lenBytes int) int {
-	headerSize := 1 + lenBytes
-	if len(data)-pos < headerSize {
-		return 0
-	}
-	length := readLen(data, pos+1, lenBytes)
-	total := headerSize + length
-	if len(data)-pos < total {
-		return 0
-	}
-	return total
-}
-
-// scanExtVarLen mirrors copyExtVarLen without writing.
-func scanExtVarLen(data []byte, pos, lenBytes int) int {
-	headerSize := 1 + lenBytes + 1 // format + len + type byte
-	if len(data)-pos < headerSize {
-		return 0
-	}
-	length := readLen(data, pos+1, lenBytes)
-	total := headerSize + length
-	if len(data)-pos < total {
-		return 0
-	}
-	return total
-}
-
-// walkMsgpackValue parses one msgpack value at data[pos], appends the
-// (possibly converted) bytes to *result, and returns the number of bytes
-// consumed from data. Returns 0 if the data is truncated/malformed.
-func walkMsgpackValue(data []byte, pos int, result *[]byte) int {
-	if pos >= len(data) {
-		return 0
-	}
-	b := data[pos]
-	remaining := len(data) - pos
-
-	// --- Fixed-length single-byte types ---
-	// positive fixint 0x00-0x7f, negative fixint 0xe0-0xff, nil 0xc0, never used 0xc1, bool 0xc2-0xc3
-	if b <= 0x7f || b >= 0xe0 || (b >= 0xc0 && b <= 0xc3) {
-		*result = append(*result, b)
-		return 1
-	}
-
-	// --- fixstr (0xa0-0xbf): 1 header + N data bytes ---
-	if b >= 0xa0 && b <= 0xbf {
-		n := int(b & 0x1f)
-		total := 1 + n
-		if remaining < total {
-			return 0
-		}
-		*result = append(*result, data[pos:pos+total]...)
-		return total
-	}
-
-	// --- fixmap (0x80-0x8f): N key-value pairs ---
-	if b >= 0x80 && b <= 0x8f {
-		count := int(b & 0x0f)
-		*result = append(*result, b)
-		consumed := 1
-		for i := 0; i < count*2; i++ {
-			c := walkMsgpackValue(data, pos+consumed, result)
-			if c <= 0 {
-				return 0
-			}
-			consumed += c
-		}
-		return consumed
-	}
-
-	// --- fixarray (0x90-0x9f): N elements ---
-	if b >= 0x90 && b <= 0x9f {
-		count := int(b & 0x0f)
-		*result = append(*result, b)
-		consumed := 1
-		for i := 0; i < count; i++ {
-			c := walkMsgpackValue(data, pos+consumed, result)
-			if c <= 0 {
-				return 0
-			}
-			consumed += c
-		}
-		return consumed
-	}
-
-	switch b {
-	// --- float32, float64 ---
-	case 0xca: // float32: 1+4
-		return copyFixed(data, pos, 5, result)
-	case 0xcb: // float64: 1+8
-		return copyFixed(data, pos, 9, result)
-
-	// --- unsigned integers ---
-	case 0xcc: // uint8: 1+1
-		return copyFixed(data, pos, 2, result)
-	case 0xcd: // uint16: 1+2
-		return copyFixed(data, pos, 3, result)
-	case 0xce: // uint32: 1+4
-		return copyFixed(data, pos, 5, result)
-	case 0xcf: // uint64: 1+8
-		return copyFixed(data, pos, 9, result)
-
-	// --- signed integers ---
-	case 0xd0: // int8: 1+1
-		return copyFixed(data, pos, 2, result)
-	case 0xd1: // int16: 1+2
-		return copyFixed(data, pos, 3, result)
-	case 0xd2: // int32: 1+4
-		return copyFixed(data, pos, 5, result)
-	case 0xd3: // int64: 1+8
-		return copyFixed(data, pos, 9, result)
-
-	// --- fixext 1/2/4/8/16 ---
-	case 0xd4: // fixext1: 1+1+1
-		return copyFixed(data, pos, 3, result)
-	case 0xd5: // fixext2: 1+1+2
-		return copyFixed(data, pos, 4, result)
-	case 0xd6: // fixext4: 1+1+4
-		return copyFixed(data, pos, 6, result)
-	case 0xd7: // fixext8: 1+1+8
-		return copyFixed(data, pos, 10, result)
-	case 0xd8: // fixext16: 1+1+16
-		return copyFixed(data, pos, 18, result)
-
-	// --- bin 8/16/32 ---
-	case 0xc4: // bin8: 1 + 1-byte len + data
-		return copyVarLen(data, pos, 1, result)
-	case 0xc5: // bin16: 1 + 2-byte len + data
-		return copyVarLen(data, pos, 2, result)
-	case 0xc6: // bin32: 1 + 4-byte len + data
-		return copyVarLen(data, pos, 4, result)
-
-	// --- ext 8/16/32 ---
-	case 0xc7: // ext8: 1 + 1-byte len + 1 type + data
-		return copyExtVarLen(data, pos, 1, result)
-	case 0xc8: // ext16: 1 + 2-byte len + 1 type + data
-		return copyExtVarLen(data, pos, 2, result)
-	case 0xc9: // ext32: 1 + 4-byte len + 1 type + data
-		return copyExtVarLen(data, pos, 4, result)
-
-	// --- str8 (0xd9): already compact, just copy ---
-	case 0xd9: // str8: 1 + 1-byte len + data
-		return copyVarLen(data, pos, 1, result)
-
-	// --- str16 (0xda): THE conversion target ---
-	case 0xda: // str16: 1 + 2-byte len + data
-		if remaining < 3 {
-			return 0
-		}
-		length := (int(data[pos+1]) << 8) | int(data[pos+2])
-		total := 3 + length
-		if remaining < total {
-			return 0
-		}
-		if length < 256 {
-			*result = append(*result, 0xd9)
-			*result = append(*result, byte(length)) // #nosec G115 -- length is guaranteed < 256 by the if-guard above
-			*result = append(*result, data[pos+3:pos+total]...)
-		} else {
-			*result = append(*result, data[pos:pos+total]...)
-		}
-		return total
-
-	// --- str32 (0xdb): just copy ---
-	case 0xdb: // str32: 1 + 4-byte len + data
-		return copyVarLen(data, pos, 4, result)
-
-	// --- array16/32 ---
-	case 0xdc: // array16: 1 + 2-byte count
-		if remaining < 3 {
-			return 0
-		}
-		count := (int(data[pos+1]) << 8) | int(data[pos+2])
-		*result = append(*result, data[pos:pos+3]...)
-		consumed := 3
-		for i := 0; i < count; i++ {
-			c := walkMsgpackValue(data, pos+consumed, result)
-			if c <= 0 {
-				return 0
-			}
-			consumed += c
-		}
-		return consumed
-	case 0xdd: // array32: 1 + 4-byte count
-		if remaining < 5 {
-			return 0
-		}
-		count := (int(data[pos+1]) << 24) | (int(data[pos+2]) << 16) | (int(data[pos+3]) << 8) | int(data[pos+4])
-		*result = append(*result, data[pos:pos+5]...)
-		consumed := 5
-		for i := 0; i < count; i++ {
-			c := walkMsgpackValue(data, pos+consumed, result)
-			if c <= 0 {
-				return 0
-			}
-			consumed += c
-		}
-		return consumed
-
-	// --- map16/32 ---
-	case 0xde: // map16: 1 + 2-byte count
-		if remaining < 3 {
-			return 0
-		}
-		count := (int(data[pos+1]) << 8) | int(data[pos+2])
-		*result = append(*result, data[pos:pos+3]...)
-		consumed := 3
-		for i := 0; i < count*2; i++ {
-			c := walkMsgpackValue(data, pos+consumed, result)
-			if c <= 0 {
-				return 0
-			}
-			consumed += c
-		}
-		return consumed
-	case 0xdf: // map32: 1 + 4-byte count
-		if remaining < 5 {
-			return 0
-		}
-		count := (int(data[pos+1]) << 24) | (int(data[pos+2]) << 16) | (int(data[pos+3]) << 8) | int(data[pos+4])
-		*result = append(*result, data[pos:pos+5]...)
-		consumed := 5
-		for i := 0; i < count*2; i++ {
-			c := walkMsgpackValue(data, pos+consumed, result)
-			if c <= 0 {
-				return 0
-			}
-			consumed += c
-		}
-		return consumed
-
-	default:
-		// Unknown type: copy single byte as fail-safe
-		*result = append(*result, b)
-		return 1
-	}
-}
-
-// copyFixed copies exactly `size` bytes from data[pos:] to result.
-// Returns 0 if data is truncated.
-func copyFixed(data []byte, pos, size int, result *[]byte) int {
-	if len(data)-pos < size {
-		return 0
-	}
-	*result = append(*result, data[pos:pos+size]...)
-	return size
-}
-
-// copyVarLen handles msgpack types with a variable-length data payload:
-// header(1) + length(lenBytes) + data(length). Copies as-is.
-func copyVarLen(data []byte, pos, lenBytes int, result *[]byte) int {
-	headerSize := 1 + lenBytes
-	if len(data)-pos < headerSize {
-		return 0
-	}
-	length := readLen(data, pos+1, lenBytes)
-	total := headerSize + length
-	if len(data)-pos < total {
-		return 0
-	}
-	*result = append(*result, data[pos:pos+total]...)
-	return total
-}
-
-// copyExtVarLen handles ext types: header(1) + length(lenBytes) + type(1) + data(length).
-func copyExtVarLen(data []byte, pos, lenBytes int, result *[]byte) int {
-	headerSize := 1 + lenBytes + 1 // format + len + type byte
-	if len(data)-pos < headerSize {
-		return 0
-	}
-	length := readLen(data, pos+1, lenBytes)
-	total := headerSize + length
-	if len(data)-pos < total {
-		return 0
-	}
-	*result = append(*result, data[pos:pos+total]...)
-	return total
-}
-
-// readLen reads a big-endian unsigned integer of 1, 2, or 4 bytes.
-func readLen(data []byte, pos, size int) int {
-	switch size {
-	case 1:
-		return int(data[pos])
-	case 2:
-		return (int(data[pos]) << 8) | int(data[pos+1])
-	case 4:
-		return (int(data[pos]) << 24) | (int(data[pos+1]) << 16) | (int(data[pos+2]) << 8) | int(data[pos+3])
-	default:
-		return 0
-	}
-}
-
-// actionBufPool recycles the msgpack encode buffers used by actionHash;
-// 256 bytes covers typical action payloads without regrowth.
-var actionBufPool = sync.Pool{New: func() any {
-	return bytes.NewBuffer(make([]byte, 0, 256))
+// actionEncoderPool recycles action encoders; 256 bytes covers typical action
+// payloads without regrowth.
+var actionEncoderPool = sync.Pool{New: func() any {
+	buf := bytes.NewBuffer(make([]byte, 0, 256))
+	return &actionEncoder{buf: buf, enc: msgpack.NewEncoder(buf)}
 }}
 
-// actionEncPool recycles msgpack encoders. UseCompactInts is set once at
-// creation and persists across Reset.
-var actionEncPool = sync.Pool{New: func() any {
-	enc := msgpack.NewEncoder(nil)
-	enc.UseCompactInts(true)
-	return enc
-}}
-
-func actionHash(action any, vaultAddress string, nonce int64, expiresAfter *int64) [32]byte {
-	buf := actionBufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	defer actionBufPool.Put(buf)
-
-	enc := actionEncPool.Get().(*msgpack.Encoder)
-	enc.Reset(buf)
-	defer actionEncPool.Put(enc)
+// getActionEncoder returns a pooled encoder with a cleared buffer and the
+// Python-compatible options armed.
+func getActionEncoder() *actionEncoder {
+	ae := actionEncoderPool.Get().(*actionEncoder)
+	ae.buf.Reset()
+	ae.enc.Reset(ae.buf)
+	ae.enc.UseCompactInts(true) // Reset() cleared it — see actionEncoder
 	// CRITICAL: Do NOT use SetSortMapKeys(true) - Python preserves insertion order
 	// Structs in Go will serialize fields in the order they are defined
+	return ae
+}
 
-	err := enc.Encode(action)
-	if err != nil {
-		panic(fmt.Sprintf("failed to marshal action: %v", err))
+func actionHash(
+	action any,
+	vaultAddress string,
+	nonce int64,
+	expiresAfter *int64,
+) ([32]byte, error) {
+	ae := getActionEncoder()
+	defer actionEncoderPool.Put(ae)
+
+	if err := ae.enc.Encode(action); err != nil {
+		return [32]byte{}, fmt.Errorf("failed to marshal action: %w", err)
 	}
 
-	// Convert fixstr to str8 for Python compatibility. Reserve extra capacity
-	// for the trailer (8-byte nonce + up to 1+20 vault + 1+8 expires) so the
-	// appends below don't reallocate.
-	data := convertStr16ToStr8Extra(buf.Bytes(), 38)
+	// The msgpack bytes go into the hash as produced: the pinned encoder emits
+	// str8 headers for strings shorter than 256 bytes, matching Python's
+	// msgpack, so no header rewriting is needed
+	// (TestMsgpackStringHeadersStayPythonCompatible pins this). The trailer
+	// appended below (8-byte nonce + up to 1+20 vault + 1+8 expires) fits in
+	// the pooled buffer's spare capacity, which is cleared on the next Get.
+	data := ae.buf.Bytes()
 
 	// Add nonce as 8 bytes big endian
 	if nonce < 0 {
-		panic(fmt.Sprintf("nonce cannot be negative: %d", nonce))
+		return [32]byte{}, fmt.Errorf("nonce cannot be negative: %d", nonce)
 	}
 	data = binary.BigEndian.AppendUint64(data, uint64(nonce))
 
@@ -582,8 +86,10 @@ func actionHash(action any, vaultAddress string, nonce int64, expiresAfter *int6
 	if vaultAddress == "" {
 		data = append(data, 0x00)
 	} else {
-		var addr [20]byte
-		_, _ = hex.Decode(addr[:], []byte(strings.TrimPrefix(vaultAddress, "0x")))
+		addr, err := decodeVaultAddress(vaultAddress)
+		if err != nil {
+			return [32]byte{}, err
+		}
 		data = append(data, 0x01)
 		data = append(data, addr[:]...)
 	}
@@ -591,14 +97,34 @@ func actionHash(action any, vaultAddress string, nonce int64, expiresAfter *int6
 	// Add expires_after if provided
 	if expiresAfter != nil {
 		if *expiresAfter < 0 {
-			panic(fmt.Sprintf("expiresAfter cannot be negative: %d", *expiresAfter))
+			return [32]byte{}, fmt.Errorf("expiresAfter cannot be negative: %d", *expiresAfter)
 		}
 		data = append(data, 0x00)
 		data = binary.BigEndian.AppendUint64(data, uint64(*expiresAfter))
 	}
 
 	// Return keccak256 hash (value return: no []byte heap allocation)
-	return crypto.Keccak256Hash(data)
+	return crypto.Keccak256Hash(data), nil
+}
+
+// decodeVaultAddress decodes a 20-byte vault address into a stack array.
+// The length is validated first: hex.Decode writes len(src)/2 bytes and
+// panics when the destination is too short, and a mistyped address must
+// surface as an error rather than a panic or a silently zero-padded address
+// that would end up inside a signed payload.
+func decodeVaultAddress(vaultAddress string) ([20]byte, error) {
+	var addr [20]byte
+	hexPart := strings.TrimPrefix(vaultAddress, "0x")
+	if len(hexPart) != 2*len(addr) {
+		return addr, fmt.Errorf(
+			"vault address must be %d hex characters (got %d): %q",
+			2*len(addr), len(hexPart), vaultAddress,
+		)
+	}
+	if _, err := hex.Decode(addr[:], []byte(hexPart)); err != nil {
+		return addr, fmt.Errorf("invalid vault address %q: %w", vaultAddress, err)
+	}
+	return addr, nil
 }
 
 // SignatureResult represents the structured signature result
@@ -975,7 +501,10 @@ func SignL1Action(
 	isMainnet bool,
 ) (SignatureResult, error) {
 	// Step 1: Create action hash
-	hash := actionHash(action, vaultAddress, timestamp, expiresAfter)
+	hash, err := actionHash(action, vaultAddress, timestamp, expiresAfter)
+	if err != nil {
+		return SignatureResult{}, fmt.Errorf("failed to hash action: %w", err)
+	}
 
 	// Step 2: EIP-712 struct hash of the phantom agent (fixed "Agent" schema,
 	// precomputed type/source hashes — no maps or reflection per call).

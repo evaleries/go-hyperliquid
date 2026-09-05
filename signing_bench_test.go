@@ -1,14 +1,12 @@
 package hyperliquid
 
 import (
-	"bytes"
 	"context"
 	"encoding/hex"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
-	"github.com/vmihailenco/msgpack/v5"
 )
 
 var (
@@ -43,52 +41,27 @@ var (
 	benchExpiresAfter = int64(1703001294567)
 )
 
-// actionHashInput returns the raw msgpack encoding of the benchmark order
-// action, as produced inside actionHash before the str16->str8 conversion.
-func actionHashInput(tb testing.TB) []byte {
-	tb.Helper()
-	var buf bytes.Buffer
-	enc := msgpack.NewEncoder(&buf)
-	enc.UseCompactInts(true)
-	if err := enc.Encode(benchOrderAction); err != nil {
-		tb.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
-// BenchmarkConvertStr16ToStr8 measures the custom msgpack walker used to
-// normalize str16 headers to str8 for Python SDK compatibility.
-func BenchmarkConvertStr16ToStr8(b *testing.B) {
-	data := actionHashInput(b)
-
-	b.ReportAllocs()
-	b.SetBytes(int64(len(data)))
-	for b.Loop() {
-		_ = convertStr16ToStr8(data)
-	}
-}
-
 // BenchmarkActionHash measures the msgpack + keccak256 hashing pipeline,
 // executed once per signed action (order, cancel, etc.).
 func BenchmarkActionHash(b *testing.B) {
 	b.Run("NoVault", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_ = actionHash(benchOrderAction, "", 1703001234567, nil)
+			_, _ = actionHash(benchOrderAction, "", 1703001234567, nil)
 		}
 	})
 
 	b.Run("Vault", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_ = actionHash(benchOrderAction, benchVaultAddress, 1703001234567, nil)
+			_, _ = actionHash(benchOrderAction, benchVaultAddress, 1703001234567, nil)
 		}
 	})
 
 	b.Run("VaultAndExpiresAfter", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			_ = actionHash(
+			_, _ = actionHash(
 				benchOrderAction,
 				benchVaultAddress,
 				1703001234567,
