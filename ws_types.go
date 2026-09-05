@@ -4,8 +4,6 @@ import (
 	"encoding/json"
 )
 
-//go:generate easyjson -all
-
 const (
 	ChannelPong               string = "pong"
 	ChannelTrades             string = "trades"
@@ -27,7 +25,17 @@ const (
 	ChannelWebData3           string = "webData3"
 )
 
+// wsMessage is the decoded websocket envelope. Data holds the raw JSON of the
+// "data" field; for large messages it references the read buffer without a
+// copy (see decodeWsEnvelope), so it must not be retained past dispatch.
 type wsMessage struct {
+	Channel string
+	Data    string
+}
+
+// wsMessageWire is the codec-facing shape of wsMessage for small payloads,
+// where a straight struct decode beats AST extraction.
+type wsMessageWire struct {
 	Channel string          `json:"channel"`
 	Data    json.RawMessage `json:"data"`
 }
@@ -59,7 +67,6 @@ type (
 		MidPx  *float64 `json:"midPx,string,omitempty"`
 	}
 
-	//easyjson:skip
 	WsAllDexsAssetCtxs struct {
 		Ctxs []Tuple2[string, AssetCtxs] `json:"ctxs"`
 	}
@@ -87,7 +94,6 @@ type (
 		Notification string `json:"notification"`
 	}
 
-	//easyjson:skip
 	WebData2 struct {
 		ClearinghouseState     *ClearinghouseState `json:"clearinghouseState,omitempty"`
 		LeadingVaults          []any               `json:"leadingVaults,omitempty"`
@@ -107,7 +113,6 @@ type (
 		PerpsAtOpenInterestCap []string            `json:"perpsAtOpenInterestCap,omitempty"`
 	}
 
-	//easyjson:skip
 	WebData2Meta struct {
 		Universe     []WebData2AssetInfo                `json:"universe,omitempty"`
 		MarginTables []Tuple2[int, WebData2MarginTable] `json:"marginTables,omitempty"`
@@ -236,7 +241,6 @@ type (
 		Volume      string `json:"v"` // volume (base unit)
 	}
 
-	//easyjson:skip
 	TwapStates struct {
 		Dex    string                   `json:"dex"`
 		User   string                   `json:"user"`
@@ -256,7 +260,6 @@ type (
 		Timestamp   int64   `json:"timestamp"`
 	}
 
-	//easyjson:skip
 	WebData3 struct {
 		UserState     WebData3UserState `json:"userState"`
 		PerpDexStates []PerpDexState    `json:"perpDexStates"`

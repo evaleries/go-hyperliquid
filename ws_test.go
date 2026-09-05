@@ -75,3 +75,61 @@ func TestReadPumpReconnectsOnTimeout(t *testing.T) {
 
 	require.NoError(t, client.Close())
 }
+
+// TestReadPumpDispatchesMessage exercises the live receive path end-to-end:
+// pooled readMessage -> decodeWsEnvelope -> dispatch -> subscriber callback.
+func TestReadPumpDispatchesMessage(t *testing.T) {
+	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+
+	tradesMsg := []byte(
+		`{"channel":"trades","data":[{"coin":"BTC","side":"B","px":"65000.5","sz":"0.25","time":1703001234567,"hash":"0x5e43f6","tid":1234567890,"users":["0xaaa","0xbbb"]}]}`,
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		// Drain the client's subscribe frame, then push one trades message.
+		if _, _, err := conn.ReadMessage(); err != nil {
+			return
+		}
+		if err := conn.WriteMessage(websocket.TextMessage, tradesMsg); err != nil {
+			return
+		}
+		// Keep the connection open until the client is done.
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client := NewWebsocketClient(server.URL)
+	require.NoError(t, client.Connect(ctx))
+	defer func() { _ = client.Close() }()
+
+	got := make(chan Trades, 1)
+	_, err := client.Trades(TradesSubscriptionParams{Coin: "BTC"}, func(trades []Trade, err error) {
+		require.NoError(t, err)
+		select {
+		case got <- trades:
+		default:
+		}
+	})
+	require.NoError(t, err)
+
+	select {
+	case trades := <-got:
+		require.Len(t, trades, 1)
+		require.Equal(t, "BTC", trades[0].Coin)
+		require.Equal(t, "65000.5", trades[0].Px)
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for trades dispatch")
+	}
+}

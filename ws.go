@@ -1,8 +1,8 @@
 package hyperliquid
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -14,9 +14,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/bytedance/sonic"
+	"github.com/bytedance/sonic/ast"
 	"github.com/gorilla/websocket"
 	"github.com/sonirico/vago/lol"
-	"github.com/sonirico/vago/maps"
 )
 
 const (
@@ -136,6 +137,28 @@ func NewWebsocketClient(baseURL string, opts ...WsOpt) *WebsocketClient {
 		opt.Apply(cli)
 	}
 
+	// Precompile JSON codecs for every dispatchable payload type so the first
+	// message of each channel doesn't pay sonic's JIT compilation cost.
+	pretouchJSON(
+		wsMessageWire{},
+		Trades(nil),
+		ActiveAssetCtx{},
+		WsFastAssetCtxs(nil),
+		WsAllDexsAssetCtxs{},
+		L2Book{},
+		Candle{},
+		AllMids{},
+		Notification{},
+		WsOrders(nil),
+		WebData2{},
+		Bbo{},
+		WsOrderFills{},
+		ClearinghouseStateMessage{},
+		OpenOrders{},
+		TwapStates{},
+		WebData3{},
+	)
+
 	return cli
 }
 
@@ -243,6 +266,41 @@ func (w *WebsocketClient) close() error {
 
 // Private methods
 
+// wsBufPool recycles websocket message buffers: conn.ReadMessage allocates a
+// fresh slice per message (a ~100KB webData2 message is ~250KB of garbage
+// with buffer regrowth), while a pooled buffer is reused across messages.
+var wsBufPool = sync.Pool{New: func() any {
+	return bytes.NewBuffer(make([]byte, 0, 8*1024))
+}}
+
+// wsMaxRetainedBuf caps pooled buffer capacity — a single huge message must
+// not pin a large allocation in the pool forever.
+const wsMaxRetainedBuf = 512 * 1024
+
+func releaseWSBuf(buf *bytes.Buffer) {
+	if buf.Cap() <= wsMaxRetainedBuf {
+		wsBufPool.Put(buf)
+	}
+}
+
+// readMessage reads one websocket message into a pooled buffer. The caller
+// must releaseWSBuf it after the message has been fully processed (dispatch
+// is synchronous; sonic's stdlib-compatible config copies decoded strings,
+// so nothing references the buffer afterwards).
+func (w *WebsocketClient) readMessage() (*bytes.Buffer, error) {
+	_, r, err := w.conn.NextReader()
+	if err != nil {
+		return nil, err
+	}
+	buf := wsBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	if _, err := buf.ReadFrom(r); err != nil {
+		releaseWSBuf(buf)
+		return nil, err
+	}
+	return buf, nil
+}
+
 func (w *WebsocketClient) readPump(ctx context.Context) {
 	shouldReconnect := false
 	defer func() {
@@ -270,7 +328,7 @@ func (w *WebsocketClient) readPump(ctx context.Context) {
 				return
 			}
 
-			_, msg, err := w.conn.ReadMessage()
+			buf, err := w.readMessage()
 			if err != nil {
 				var netErr net.Error
 				if errors.As(err, &netErr) && netErr.Timeout() {
@@ -285,18 +343,20 @@ func (w *WebsocketClient) readPump(ctx context.Context) {
 			}
 
 			if w.debug {
-				w.logDebugf("[<] %s", string(msg))
+				w.logDebugf("[<] %s", buf.String())
 			}
 
-			var wsMsg wsMessage
-			if err := json.Unmarshal(msg, &wsMsg); err != nil {
+			wsMsg, err := decodeWsEnvelope(buf.Bytes())
+			if err != nil {
 				w.logErrf("websocket message parse error: %v", err)
+				releaseWSBuf(buf)
 				continue
 			}
 
 			if err := w.dispatch(wsMsg); err != nil {
 				w.logErrf("failed to dispatch websocket message: %v", err)
 			}
+			releaseWSBuf(buf)
 		}
 	}
 }
@@ -321,17 +381,64 @@ func (w *WebsocketClient) pingPump(ctx context.Context) {
 	}
 }
 
+// wsEnvelopeAstThreshold is the message size above which the envelope is
+// extracted via sonic's lazy AST (zero-copy reference into the read buffer)
+// instead of a struct decode (which copies the whole data subtree into a
+// json.RawMessage). Measured on arm64: for a ~54KB webData2 message the AST
+// path costs 141µs/1KB vs 211µs/250KB for the copying path; below ~2KB the
+// struct decode is ~300ns cheaper.
+const wsEnvelopeAstThreshold = 2048
+
+func decodeWsEnvelope(msg []byte) (wsMessage, error) {
+	if len(msg) >= wsEnvelopeAstThreshold {
+		// CopyReturn=false: the envelope string references the (pooled) read
+		// buffer, which outlives the synchronous dispatch — no subtree copy.
+		// ValidateJSON=false: the dispatcher's UnmarshalFromString validates
+		// the data subtree anyway, so a full pre-validation scan is redundant.
+		node, err := sonic.GetWithOptions(
+			msg,
+			ast.SearchOptions{CopyReturn: false, ValidateJSON: false},
+		)
+		if err != nil {
+			return wsMessage{}, fmt.Errorf("failed to parse websocket message: %w", err)
+		}
+		channel, _ := node.Get("channel").String()
+		wsMsg := wsMessage{Channel: channel}
+		if data := node.Get("data"); data.Valid() {
+			raw, err := data.Raw()
+			if err != nil {
+				return wsMessage{}, fmt.Errorf("failed to parse websocket message data: %w", err)
+			}
+			wsMsg.Data = raw
+		}
+		return wsMsg, nil
+	}
+
+	var wire wsMessageWire
+	if err := jsonCodec.Unmarshal(msg, &wire); err != nil {
+		return wsMessage{}, fmt.Errorf("failed to parse websocket message: %w", err)
+	}
+	return wsMessage{Channel: wire.Channel, Data: string(wire.Data)}, nil
+}
+
 func (w *WebsocketClient) dispatch(msg wsMessage) error {
 	dispatcher, ok := w.msgDispatcherRegistry[msg.Channel]
 	if !ok {
 		return fmt.Errorf("no dispatcher for channel: %s", msg.Channel)
 	}
 
-	w.mu.RLock()
-	subscribers := maps.Values(w.subscribers)
-	w.mu.RUnlock()
+	return dispatcher.Dispatch(w.lookupSubscriber, msg)
+}
 
-	return dispatcher.Dispatch(subscribers, msg)
+// lookupSubscriber resolves a subscription key to its subscriber with an O(1)
+// map lookup. The returned pointer is safe to use after the lock is released:
+// uniqSubscriber has its own mutex, and dispatching to a subscriber that was
+// concurrently removed is a harmless no-op.
+func (w *WebsocketClient) lookupSubscriber(key string) (*uniqSubscriber, bool) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	sub, ok := w.subscribers[key]
+	return sub, ok
 }
 
 func (w *WebsocketClient) reconnect(ctx context.Context) {
@@ -390,7 +497,7 @@ func (w *WebsocketClient) writeJSON(v any) error {
 	}
 
 	if w.debug {
-		bts, _ := json.Marshal(v)
+		bts, _ := jsonCodec.Marshal(v)
 		w.logDebugf("[>] %s", string(bts))
 	}
 
