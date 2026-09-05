@@ -1,7 +1,5 @@
 package hyperliquid
 
-//go:generate easyjson -all
-
 // Action structs with deterministic field ordering for consistent MessagePack serialization
 // The order of fields in these structs is critical for signature generation
 
@@ -135,7 +133,9 @@ type OrderWireType struct {
 
 // OrderWireTypeLimit represents a limit order with time-in-force.
 type OrderWireTypeLimit struct {
-	Tif Tif `json:"tif,string" msgpack:"tif"`
+	// Note: no `,string` on Tif — easyjson ignores that option on string kinds,
+	// but encoding/json/sonic honor it and would double-encode ("\"Gtc\"").
+	Tif Tif `json:"tif" msgpack:"tif"`
 }
 
 // OrderWireTypeTrigger represents a trigger order (stop-loss/take-profit).

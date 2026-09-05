@@ -4,8 +4,6 @@ import (
 	json "encoding/json"
 )
 
-//go:generate easyjson -all
-
 type Side string
 
 const (

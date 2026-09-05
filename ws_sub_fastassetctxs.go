@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/base64"
-	"encoding/json"
 	"fmt"
 	"io"
 )
@@ -12,7 +11,7 @@ import (
 // Data for this type is compressed, decode the base64 then uncompress (RFC 1951, raw — no zlib/gzip wrapper).
 func (w *WsFastAssetCtxs) UnmarshalJSON(data []byte) error {
 	var b64 string
-	if err := json.Unmarshal(data, &b64); err != nil {
+	if err := jsonCodec.Unmarshal(data, &b64); err != nil {
 		return fmt.Errorf("fastAssetCtxs: data is not a string: %w", err)
 	}
 
@@ -27,7 +26,7 @@ func (w *WsFastAssetCtxs) UnmarshalJSON(data []byte) error {
 	}
 
 	var ctxs map[string]FastAssetCtx
-	if err := json.Unmarshal(raw, &ctxs); err != nil {
+	if err := jsonCodec.Unmarshal(raw, &ctxs); err != nil {
 		return fmt.Errorf("fastAssetCtxs: json decode: %w", err)
 	}
 

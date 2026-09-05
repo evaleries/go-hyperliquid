@@ -55,9 +55,9 @@ lint: ## Run golangci-lint
 	golangci-lint run
 
 fmt: ## Format code
-	@find . -name "*.go" -not -name "*_easyjson.go"  | xargs gofmt -s -w
-	@find . -name "*.go" -not -name "*_easyjson.go"  | xargs goimports -w
-	@find . -name "*.go" -not -name "*_easyjson.go"  | xargs golines -w
+	@find . -name "*.go" | xargs gofmt -s -w
+	@find . -name "*.go" | xargs goimports -w
+	@find . -name "*.go" | xargs golines -w
 
 vet: ## Run go vet
 	$(GOCMD) vet ./...
@@ -68,7 +68,7 @@ mod-verify: ## Verify dependencies
 	$(GOMOD) verify
 
 install-tools: ## Install development tools
-	$(GOINSTALL) github.com/mailru/easyjson/easyjson@latest
 	$(GOINSTALL) github.com/golangci/golangci-lint/cmd/golangci-lint@latest
 	$(GOINSTALL) golang.org/x/tools/cmd/goimports@latest
 	$(GOINSTALL) github.com/segmentio/golines@latest
+	$(GOINSTALL) golang.org/x/perf/cmd/benchstat@latest

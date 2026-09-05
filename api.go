@@ -57,7 +57,7 @@ func (r *APIResponse[T]) UnmarshalJSON(data []byte) error {
 	b := responseData.MarshalTo(nil)
 
 	// Use fastjson's built-in unmarshaling if possible, fallback to json.Unmarshal
-	if err := json.Unmarshal(b, &r.Data); err != nil {
+	if err := jsonCodec.Unmarshal(b, &r.Data); err != nil {
 		return fmt.Errorf("failed to unmarshal response data: %w", err)
 	}
 
@@ -71,16 +71,16 @@ type Tuple2[E1 any, E2 any] struct {
 
 func (t *Tuple2[E1, E2]) UnmarshalJSON(data []byte) error {
 	var raw []json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
+	if err := jsonCodec.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	if len(raw) != 2 {
 		return fmt.Errorf("expected array of length 2, got %d", len(raw))
 	}
-	if err := json.Unmarshal(raw[0], &t.First); err != nil {
+	if err := jsonCodec.Unmarshal(raw[0], &t.First); err != nil {
 		return err
 	}
-	if err := json.Unmarshal(raw[1], &t.Second); err != nil {
+	if err := jsonCodec.Unmarshal(raw[1], &t.Second); err != nil {
 		return err
 	}
 	return nil
@@ -103,7 +103,7 @@ func (mv MixedValue) MarshalJSON() ([]byte, error) {
 
 func (mv *MixedValue) String() (string, bool) {
 	var s string
-	if err := json.Unmarshal(*mv, &s); err != nil {
+	if err := jsonCodec.Unmarshal(*mv, &s); err != nil {
 		return "", false
 	}
 	return s, true
@@ -111,7 +111,7 @@ func (mv *MixedValue) String() (string, bool) {
 
 func (mv *MixedValue) Object() (map[string]any, bool) {
 	var obj map[string]any
-	if err := json.Unmarshal(*mv, &obj); err != nil {
+	if err := jsonCodec.Unmarshal(*mv, &obj); err != nil {
 		return nil, false
 	}
 	return obj, true
@@ -119,14 +119,14 @@ func (mv *MixedValue) Object() (map[string]any, bool) {
 
 func (mv *MixedValue) Array() ([]json.RawMessage, bool) {
 	var arr []json.RawMessage
-	if err := json.Unmarshal(*mv, &arr); err != nil {
+	if err := jsonCodec.Unmarshal(*mv, &arr); err != nil {
 		return nil, false
 	}
 	return arr, true
 }
 
 func (mv *MixedValue) Parse(v any) error {
-	return json.Unmarshal(*mv, v)
+	return jsonCodec.Unmarshal(*mv, v)
 }
 
 func (mv *MixedValue) Type() string {
@@ -156,7 +156,7 @@ type MixedArray []MixedValue
 
 func (ma *MixedArray) UnmarshalJSON(data []byte) error {
 	var rawArr []MixedValue
-	if err := json.Unmarshal(data, &rawArr); err != nil {
+	if err := jsonCodec.Unmarshal(data, &rawArr); err != nil {
 		return err
 	}
 

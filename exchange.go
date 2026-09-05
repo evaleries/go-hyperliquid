@@ -3,7 +3,6 @@ package hyperliquid
 import (
 	"context"
 	"crypto/ecdsa"
-	"encoding/json"
 	"sync/atomic"
 	"time"
 
@@ -56,6 +55,19 @@ func NewExchange(
 
 	ex.client = newClient(baseURL, ex.clientOpts...)
 	ex.info = NewInfo(ctx, baseURL, true, meta, spotMeta, perpDexs, ex.infoOpts...)
+
+	// Precompile JSON codecs for the hot trading actions and their responses
+	// so the first order doesn't pay sonic's JIT compilation cost.
+	pretouchJSON(
+		OrderAction{},
+		OrderResponse{},
+		CancelAction{},
+		CancelByCloidAction{},
+		BatchModifyAction{},
+		UpdateLeverageAction{},
+		UpdateIsolatedMarginAction{},
+		SignatureResult{},
+	)
 
 	return ex
 }
@@ -168,7 +180,7 @@ func (e *Exchange) executeAction(ctx context.Context, action, result any) error 
 		return err
 	}
 
-	if err := json.Unmarshal(resp, result); err != nil {
+	if err := jsonCodec.Unmarshal(resp, result); err != nil {
 		return err
 	}
 

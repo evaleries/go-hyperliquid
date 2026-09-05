@@ -2,7 +2,6 @@ package hyperliquid
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 )
 
@@ -17,7 +16,7 @@ type CreateOrderRequest struct {
 }
 
 func (s *CreateOrderRequest) String() string {
-	data, _ := json.Marshal(s)
+	data, _ := jsonCodec.Marshal(s)
 	return string(data)
 }
 
@@ -40,12 +39,14 @@ type OrderStatus struct {
 }
 
 func (s *OrderStatus) String() string {
-	data, _ := json.Marshal(s)
+	data, _ := jsonCodec.Marshal(s)
 	return string(data)
 }
 
 type OrderResponse struct {
-	Statuses []OrderStatus
+	// Explicit tag required: easyjson matches keys exactly (no stdlib-style
+	// case-insensitive fallback). The API sends "statuses".
+	Statuses []OrderStatus `json:"statuses"`
 }
 
 func newOrderTypeWire(o CreateOrderRequest) OrderWireType {

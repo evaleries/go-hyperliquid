@@ -5,8 +5,6 @@ import (
 	"strings"
 )
 
-//go:generate easyjson -all
-
 type APIError struct {
 	Code    int    `json:"code"`
 	Message string `json:"msg"`

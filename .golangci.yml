@@ -87,11 +87,6 @@ issues:
         - funlen
         - dupl
         - goconst
-    - path: _easyjson\.go
-      linters:
-        - stylecheck
-        - unused
-        - gocritic
     # Exclude empty branch in debug code
     - linters:
         - staticcheck

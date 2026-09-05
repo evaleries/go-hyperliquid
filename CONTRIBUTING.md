@@ -65,17 +65,17 @@ Thank you for your interest in contributing to go-hyperliquid! This document pro
    git commit -m "feat: add your feature description"
    ```
 
-> **⚠️ Important**: The CI will fail if generated files are out of date or if `go vet` finds issues. Always run `make generate` and `make check` before pushing.
+> **⚠️ Important**: The CI will fail if `go vet` finds issues. Always run `make check` before pushing.
 
-### Code Generation
+### JSON Codec
 
-This project uses `easyjson` for high-performance JSON marshaling/unmarshaling. If you modify any structs with `//go:generate easyjson` comments, you need to regenerate the code:
+This project uses [sonic](https://github.com/bytedance/sonic) (`sonic.ConfigStd`) for high-performance JSON marshaling/unmarshaling — no code generation step is required. All JSON goes through the package-level `jsonCodec` in `json.go`; use it instead of `encoding/json` in library code.
 
-```bash
-make generate
-```
+Caveats when editing wire types:
 
-**Important**: Always commit the generated files along with your changes.
+- The codec matches JSON keys **exactly** (no stdlib-style case-insensitive fallback) — every wire field must have an explicit `json:"..."` tag.
+- Do not add `,string` to string-kind fields (it double-encodes them).
+- Hot types are precompiled via `pretouchJSON` in `NewWebsocketClient`/`NewExchange`; add new high-frequency payload types there.
 
 ### Commit Messages
 

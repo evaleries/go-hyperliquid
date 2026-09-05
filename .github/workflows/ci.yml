@@ -36,9 +36,6 @@ jobs:
     - name: Download dependencies
       run: go mod download
 
-    - name: Install tools
-      run: go install github.com/mailru/easyjson/...@latest
-
     - name: Verify dependencies
       run: go mod verify
 
@@ -47,21 +44,10 @@ jobs:
 
     - name: Check formatting
       run: |
-        UNFORMATTED=$(find . -name "*.go" -not -name "*_easyjson.go" -not -path "./examples/*" | xargs gofmt -s -l)
+        UNFORMATTED=$(find . -name "*.go" -not -path "./examples/*" | xargs gofmt -s -l)
         if [ -n "$UNFORMATTED" ]; then
           echo "The following files are not formatted:"
           echo "$UNFORMATTED"
-          exit 1
-        fi
-
-    - name: Check generated files
-      run: |
-        go generate ./...
-        CHANGES=$(git status --porcelain | grep "_easyjson.go$" || true)
-        if [ -n "$CHANGES" ]; then
-          echo "Generated easyjson files are not up to date. Please run 'go generate ./...' and commit the changes."
-          echo "Files with changes:"
-          echo "$CHANGES"
           exit 1
         fi
 

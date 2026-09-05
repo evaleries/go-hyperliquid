@@ -2,8 +2,6 @@ package hyperliquid
 
 import "github.com/sonirico/vago/fp"
 
-//go:generate easyjson -all
-
 type remoteL2BookSubscriptionPayload struct {
 	Type     string `json:"type"`
 	Coin     string `json:"coin"`
