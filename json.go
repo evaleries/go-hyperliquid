@@ -9,8 +9,14 @@ import (
 // jsonCodec is the SDK-wide JSON codec: sonic with the stdlib-compatible
 // configuration (HTML escaping enabled, map keys sorted), keeping wire
 // payloads byte-compatible with encoding/json while getting sonic's
-// JIT-accelerated (un)marshaling. Single point of change if codec options
-// ever need tuning (e.g. CopyString for cached payloads).
+// JIT-accelerated (un)marshaling.
+//
+// CopyString is load-bearing, not a tunable: the websocket receive path
+// hands decoders a Data string that points into a pooled read buffer (see
+// decodeWsEnvelope), so decoded values must be copies. Switching to a
+// config without CopyString would corrupt dispatched payloads as soon as
+// the buffer is reused — TestDecodeWsEnvelopeDoesNotAliasReadBuffer and
+// TestReadPumpPayloadSurvivesBufferReuse guard this.
 var jsonCodec = sonic.ConfigStd
 
 // pretouchJSON compiles sonic codecs for the given (zero) values upfront.

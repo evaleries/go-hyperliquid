@@ -87,7 +87,7 @@ func (t *Tuple2[E1, E2]) UnmarshalJSON(data []byte) error {
 }
 
 func (t Tuple2[E1, E2]) MarshalJSON() ([]byte, error) {
-	return json.Marshal([2]any{t.First, t.Second})
+	return jsonCodec.Marshal([2]any{t.First, t.Second})
 }
 
 type MixedValue json.RawMessage
@@ -179,7 +179,7 @@ func (ma MixedArray) FirstError() error {
 					return errors.New(msg)
 				}
 				// stringify unknown error shapes
-				b, _ := json.Marshal(v)
+				b, _ := jsonCodec.Marshal(v)
 				return errors.New(string(b))
 			}
 		}

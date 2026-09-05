@@ -12,7 +12,7 @@ type (
 	}
 
 	CancelOrderResponse struct {
-		Statuses MixedArray
+		Statuses MixedArray `json:"statuses"`
 	}
 )
 

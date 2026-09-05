@@ -29,7 +29,9 @@ type OrderStatusResting struct {
 type OrderStatusFilled struct {
 	TotalSz string `json:"totalSz"`
 	AvgPx   string `json:"avgPx"`
-	Oid     int    `json:"oid"`
+	// int64, matching OrderStatusResting.Oid: live order ids already exceed
+	// int32 (e.g. 41569108691), which would overflow a 32-bit int.
+	Oid int64 `json:"oid"`
 }
 
 type OrderStatus struct {
@@ -44,8 +46,9 @@ func (s *OrderStatus) String() string {
 }
 
 type OrderResponse struct {
-	// Explicit tag required: easyjson matches keys exactly (no stdlib-style
-	// case-insensitive fallback). The API sends "statuses".
+	// Explicit tag: the API sends "statuses". The codec would also match the
+	// field name case-insensitively (like encoding/json), but tagging keeps
+	// the wire key explicit and the intent documented.
 	Statuses []OrderStatus `json:"statuses"`
 }
 

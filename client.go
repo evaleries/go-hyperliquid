@@ -6,7 +6,6 @@ package hyperliquid
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -115,14 +114,16 @@ func (c *client) post(ctx context.Context, path string, payload any) ([]byte, er
 	}
 
 	if resp.StatusCode >= httpErrorStatusCode {
-		if !json.Valid(body) {
-			return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
-		}
+		// Only surface a typed APIError when the body actually looks like one:
+		// sonic ignores unknown keys, so an unrelated JSON error shape would
+		// otherwise decode into a zero APIError and report "API error 0: ",
+		// throwing away the status code and the real body.
 		var apiErr APIError
-		if err := jsonCodec.Unmarshal(body, &apiErr); err != nil {
-			return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+		if err := jsonCodec.Unmarshal(body, &apiErr); err == nil &&
+			(apiErr.Code != 0 || apiErr.Message != "") {
+			return nil, apiErr
 		}
-		return nil, apiErr
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
 	}
 
 	return body, nil
