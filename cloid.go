@@ -1,7 +1,6 @@
 package hyperliquid
 
 import (
-	"encoding/hex"
 	"fmt"
 	"strings"
 )
@@ -33,9 +32,13 @@ func normalizeCloid(cloid *string) (*string, error) {
 		)
 	}
 
-	// Verify the hex part (excluding 0x) is valid hex
-	if _, err := hex.DecodeString(cloidValue[2:]); err != nil {
-		return nil, fmt.Errorf("cloid must be valid hex string: %w", err)
+	// Verify the hex part (excluding 0x) is valid hex. A char loop avoids the
+	// allocation that hex.DecodeString would make just for validation.
+	for i := 2; i < len(cloidValue); i++ {
+		c := cloidValue[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') && (c < 'A' || c > 'F') {
+			return nil, fmt.Errorf("cloid must be valid hex string: invalid character %q", c)
+		}
 	}
 
 	// Return normalized value WITH 0x prefix to match Python SDK

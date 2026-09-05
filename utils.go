@@ -49,8 +49,11 @@ func formatFloat(f float64) string {
 
 // floatToWire converts a float64 to a wire-compatible string format
 func floatToWire(x float64) (string, error) {
-	// Format to 8 decimal places
-	rounded := fmt.Sprintf("%.8f", x)
+	// Format to 8 decimal places. FormatFloat avoids the format-string parsing
+	// and interface boxing overhead of fmt.Sprintf("%.8f", x) — the output is
+	// identical for finite values (this path rejects NaN/Inf via the rounding
+	// check below, exactly like before).
+	rounded := strconv.FormatFloat(x, 'f', 8, 64)
 
 	// Check if rounding causes significant error
 	parsed, err := strconv.ParseFloat(rounded, 64)
