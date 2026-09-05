@@ -39,6 +39,9 @@ coverage-func: ## Show coverage by function
 bench: ## Run all benchmarks (quick sanity run)
 	$(GOTEST) -run='^$$' -bench=. -benchmem $(shell go list ./... | grep -v examples)
 
+bench-smoke: ## Compile and smoke-run benchmarks (single iteration, same as CI)
+	$(GOTEST) -run='^$$' -bench=. -benchtime=1x -benchmem $(shell go list ./... | grep -v examples)
+
 bench-long: ## Run benchmarks with statistical rigor (count=10)
 	$(GOTEST) -run='^$$' -bench=. -benchmem -count=10 $(shell go list ./... | grep -v examples)
 

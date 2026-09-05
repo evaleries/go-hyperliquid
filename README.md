@@ -15,6 +15,11 @@ Unofficial Go client for the Hyperliquid exchange API. This implementation follo
 go get github.com/sonirico/go-hyperliquid
 ```
 
+**Breaking change:** JSON is now handled by [sonic](https://github.com/bytedance/sonic) instead of easyjson, and the
+generated `MarshalJSON`/`UnmarshalJSON`/`MarshalEasyJSON`/`UnmarshalEasyJSON` methods have been removed from the wire
+types. Code that (un)marshals these types through `encoding/json` is unaffected. Code that holds an
+`easyjson.Marshaler` interface value or calls `MarshalEasyJSON`/`UnmarshalEasyJSON` directly will no longer compile.
+
 ## Features
 
 This Go SDK provides **full feature parity** with the official Python SDK, including:

@@ -73,9 +73,19 @@ This project uses [sonic](https://github.com/bytedance/sonic) (`sonic.ConfigStd`
 
 Caveats when editing wire types:
 
-- The codec matches JSON keys **exactly** (no stdlib-style case-insensitive fallback) — every wire field must have an explicit `json:"..."` tag.
+- Give every wire field an explicit `json:"..."` tag. The codec matches keys case-insensitively (`sonic.ConfigStd` leaves `CaseSensitive` off, exactly like `encoding/json`), so a missing tag usually still decodes — don't rely on it: the outbound bytes come from the field name verbatim, and a typo'd name fails silently in only one direction.
+- Payload types dispatched over the websocket must not implement `UnmarshalJSON` in a way that retains its input slice (as `MixedValue` does): sonic hands custom unmarshalers a no-copy view of the pooled read buffer.
 - Do not add `,string` to string-kind fields (it double-encodes them).
 - Hot types are precompiled via `pretouchJSON` in `NewWebsocketClient`/`NewExchange`; add new high-frequency payload types there.
+
+Platform matrix (from sonic v1.15.3: `sonic.go` carries
+`//go:build (amd64 && go1.17 && !go1.28) || (arm64 && go1.20 && !go1.28)`, `compat.go` the inverse):
+
+- The JIT path is only active on amd64 with Go >=1.17 and on arm64 with Go >=1.20, and is disabled on Go >=1.28.
+- Every other platform/toolchain silently falls back to an `encoding/json`-backed implementation: semantics are
+  equivalent, but there is no JIT speedup and `PretouchMany` (used by `pretouchJSON`) is a no-op there.
+- On JIT platforms sonic allocates executable memory, so W^X-hardened or otherwise restricted sandboxes can fail at first marshal.
+- CI covers linux/amd64 only, so the fallback path is not exercised there.
 
 ### Commit Messages
 
