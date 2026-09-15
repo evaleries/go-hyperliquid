@@ -304,6 +304,13 @@ Thanks to all the people who have contributed to this project! 🎉
                 </a>
             </td>
             <td align="center">
+                <a href="https://github.com/pucedoteth">
+                    <img src="https://avatars.githubusercontent.com/u/119044801?v=4" width="100;" alt="pucedoteth"/>
+                    <br />
+                    <sub><b>monem</b></sub>
+                </a>
+            </td>
+            <td align="center">
                 <a href="https://github.com/tpkeeper">
                     <img src="https://avatars.githubusercontent.com/u/7260146?v=4" width="100;" alt="tpkeeper"/>
                     <br />
