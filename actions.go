@@ -157,6 +157,36 @@ type OrderAction struct {
 	Builder  *BuilderInfo `json:"builder,omitempty" msgpack:"builder,omitempty"`
 }
 
+// TrailingStopRetracementWire represents the trailing stop retracement spec:
+// exactly one of Pct (percentage of the watermark price, rendered with 4
+// decimals and a '%' suffix, e.g. "1.5000%") or Px (fixed price distance in
+// quote currency, wire float string).
+type TrailingStopRetracementWire struct {
+	Pct *string `json:"pct,omitempty" msgpack:"pct,omitempty"`
+	Px  *string `json:"px,omitempty"  msgpack:"px,omitempty"`
+}
+
+// TrailingStopAction represents the trailing stop exchange action: the
+// trigger price follows the mark price in the favorable direction and a
+// market order fires once the mark retraces by the configured amount from
+// the watermark (highest mark since activation for a sell, lowest for a buy).
+//
+// CRITICAL: Field order MUST exactly match the Hyperliquid frontend's action
+// key order (type, asset, isBuy, sz, reduceOnly, retracement, activationPx) —
+// the API recomputes the L1 action hash from the posted JSON key order.
+// activationPx is always present, null when tracking starts immediately.
+// The action is not yet covered by the official API docs or SDKs; the format
+// was reverse-engineered from the Hyperliquid frontend bundle.
+type TrailingStopAction struct {
+	Type         string                      `json:"type"         msgpack:"type"`         // 1st
+	Asset        int                         `json:"asset"        msgpack:"asset"`        // 2nd
+	IsBuy        bool                        `json:"isBuy"        msgpack:"isBuy"`        // 3rd
+	Size         string                      `json:"sz"           msgpack:"sz"`           // 4th
+	ReduceOnly   bool                        `json:"reduceOnly"   msgpack:"reduceOnly"`   // 5th
+	Retracement  TrailingStopRetracementWire `json:"retracement"  msgpack:"retracement"`  // 6th
+	ActivationPx *string                     `json:"activationPx" msgpack:"activationPx"` // 7th (null allowed)
+}
+
 // ModifyAction represents a single order modification
 type ModifyAction struct {
 	Type  string    `json:"type,omitempty" msgpack:"type,omitempty"`
